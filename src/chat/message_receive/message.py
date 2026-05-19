@@ -1,10 +1,12 @@
 import asyncio
+import json
 from asyncio import Task
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from rich.traceback import install
 from sqlmodel import select
 
+from src.config.config import global_config
 from src.common.logger import get_logger
 from src.common.database.database import get_db_session
 from src.common.database.database_model import Messages
@@ -25,6 +27,143 @@ from src.common.data_models.message_component_data_model import (
 install(extra_lines=3)
 
 logger = get_logger("chat_message")
+
+
+def _build_reply_target_person_summary(
+    *,
+    platform: str,
+    user_id: str,
+    user_nickname: Optional[str],
+    user_cardname: Optional[str],
+    group_id: Optional[str],
+    gender: Optional[str] = None,
+    age: Optional[object] = None,
+) -> str:
+    """构造被回复消息发送人的基础信息摘要。"""
+
+    normalized_platform = str(platform or "").strip()
+    normalized_user_id = str(user_id or "").strip()
+    normalized_nickname = str(user_nickname or "").strip()
+    normalized_cardname = str(user_cardname or "").strip()
+    normalized_group_id = str(group_id or "").strip()
+    normalized_gender = _normalize_reply_target_gender(gender)
+    normalized_age = _normalize_reply_target_age(age)
+
+    if not normalized_platform or not normalized_user_id:
+        return ""
+
+    summary_lines: List[str] = []
+    if normalized_nickname:
+        summary_lines.append(f"昵称: {normalized_nickname}")
+    if normalized_age:
+        summary_lines.append(f"年龄: {normalized_age}")
+    if normalized_gender:
+        summary_lines.append(f"性别: {normalized_gender}")
+        preferred_title = _build_reply_target_title(normalized_gender)
+        if preferred_title:
+            summary_lines.append(f"建议称呼: {preferred_title}")
+
+    try:
+        from src.person_info.person_info import Person
+
+        person = Person(platform=normalized_platform, user_id=normalized_user_id)
+        summary_lines.append(f"是否已认识: {'是' if person.is_known else '否'}")
+        if person.is_known:
+            if person.person_name:
+                summary_lines.append(f"人物名: {person.person_name}")
+            if person.person_id:
+                summary_lines.append(f"人物ID: {person.person_id}")
+            if normalized_group_id:
+                for item in person.group_cardname_list:
+                    if str(item.get('group_id') or '').strip() != normalized_group_id:
+                        continue
+                    group_cardname = str(item.get('group_cardname') or '').strip()
+                    if group_cardname and not normalized_nickname:
+                        summary_lines.append(f"昵称: {group_cardname}")
+                    break
+    except Exception as exc:
+        logger.debug(f"构造回复对象人物摘要失败，已跳过人物信息: {exc}")
+
+    return "；".join(summary_lines)
+
+
+def _normalize_reply_target_gender(raw_gender: Optional[str]) -> str:
+    """规范化回复对象性别字段。"""
+
+    normalized_gender = str(raw_gender or "").strip().lower()
+    if normalized_gender in {"male", "man", "m", "boy", "1", "男", "男性"}:
+        return "男"
+    if normalized_gender in {"female", "woman", "f", "girl", "2", "女", "女性"}:
+        return "女"
+    if normalized_gender in {"unknown", "unk", "0", "未知", "保密", "none", "null"}:
+        return "未知"
+    return ""
+
+
+def _build_reply_target_title(normalized_gender: str) -> str:
+    """根据性别返回建议称呼。"""
+
+    if not global_config.chat.reply_target_use_gender_title:
+        return ""
+
+    if normalized_gender == "男":
+        return global_config.chat.reply_target_male_title.strip()
+    if normalized_gender == "女":
+        return global_config.chat.reply_target_female_title.strip()
+    if normalized_gender == "未知":
+        if not global_config.chat.reply_target_include_unknown_gender_title_hint:
+            return ""
+        return global_config.chat.reply_target_unknown_gender_title_hint.strip()
+    return ""
+
+
+def _normalize_reply_target_age(raw_age: Optional[object]) -> str:
+    """规范化回复对象年龄字段。"""
+
+    if raw_age is None:
+        return ""
+
+    normalized_age = str(raw_age).strip()
+    if not normalized_age:
+        return ""
+
+    if normalized_age.endswith("岁"):
+        normalized_age = normalized_age[:-1].strip()
+
+    try:
+        age_value = int(float(normalized_age))
+    except (TypeError, ValueError):
+        return ""
+
+    if age_value <= 0 or age_value > 150:
+        return ""
+    return f"{age_value}岁"
+
+
+def _extract_reply_target_gender_from_message_config(message_config: object) -> str:
+    """从消息 additional_config 中提取回复对象性别。"""
+
+    if not isinstance(message_config, dict):
+        return ""
+
+    for key in ("sex", "gender", "user_gender", "sender_gender", "napcat_sex", "napcat_gender"):
+        normalized_gender = _normalize_reply_target_gender(message_config.get(key))
+        if normalized_gender:
+            return normalized_gender
+    return ""
+
+
+def _extract_reply_target_age_from_message_config(message_config: object) -> str:
+    """从消息 additional_config 中提取回复对象年龄。"""
+
+    if not isinstance(message_config, dict):
+        return ""
+
+    for key in ("age", "user_age", "sender_age", "napcat_age"):
+        normalized_age = _normalize_reply_target_age(message_config.get(key))
+        if normalized_age:
+            return normalized_age
+    return ""
 
 
 class MsgIDMapping:
@@ -341,7 +480,6 @@ class SessionMessage(MaiMessage):
         elif component.target_user_nickname:
             return f"@{component.target_user_nickname}"
         from src.common.utils.system_utils import is_bot_self
-        from src.config.config import global_config
 
         if is_bot_self(self.platform, component.target_user_id):
             bot_nickname = global_config.bot.nickname.strip()
@@ -413,6 +551,17 @@ class SessionMessage(MaiMessage):
             component.target_message_sender_cardname = sender_info.user_cardname
             component.target_message_sender_nickname = sender_info.user_nickname
             component.target_message_sender_id = sender_info.user_id
+            reply_target_summary = _build_reply_target_person_summary(
+                platform=self.platform,
+                user_id=sender_info.user_id,
+                user_nickname=sender_info.user_nickname,
+                user_cardname=sender_info.user_cardname,
+                group_id=self.message_info.group_info.group_id if self.message_info.group_info else None,
+                gender="",
+                age=None,
+            )
+            if reply_target_summary:
+                return f"[回复了{tgt_msg_s_name}的消息: {content}][回复对象信息: {reply_target_summary}]"
             return f"[回复了{tgt_msg_s_name}的消息: {content}]"
         else:  # 尝试从数据库根据消息id查找消息内容
             try:
@@ -424,6 +573,32 @@ class SessionMessage(MaiMessage):
                         component.target_message_sender_nickname = db_msg.user_nickname
                         component.target_message_sender_id = db_msg.user_id
                         tgt_msg_s_name = db_msg.user_cardname or db_msg.user_nickname or db_msg.user_id
+                        db_additional_config = {}
+                        if db_msg.additional_config:
+                            try:
+                                parsed_additional_config = json.loads(db_msg.additional_config)
+                                if isinstance(parsed_additional_config, dict):
+                                    db_additional_config = parsed_additional_config
+                            except (TypeError, json.JSONDecodeError):
+                                logger.debug(
+                                    f"解析回复目标消息 additional_config 失败，已忽略: {component.target_message_id}"
+                                )
+                        reply_target_gender = _extract_reply_target_gender_from_message_config(db_additional_config)
+                        reply_target_age = _extract_reply_target_age_from_message_config(db_additional_config)
+                        reply_target_summary = _build_reply_target_person_summary(
+                            platform=db_msg.platform,
+                            user_id=db_msg.user_id,
+                            user_nickname=db_msg.user_nickname,
+                            user_cardname=db_msg.user_cardname,
+                            group_id=db_msg.group_id,
+                            gender=reply_target_gender,
+                            age=reply_target_age,
+                        )
+                        if reply_target_summary:
+                            return (
+                                f"[回复了{tgt_msg_s_name}的消息: {db_msg.processed_plain_text}]"
+                                f"[回复对象信息: {reply_target_summary}]"
+                            )
                         return f"[回复了{tgt_msg_s_name}的消息: {db_msg.processed_plain_text}]"
             except Exception as e:
                 logger.error(f"查询回复消息时发生错误: {e}")

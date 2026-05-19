@@ -465,6 +465,81 @@ class ChatConfig(ConfigBase):
     )
     """是否启用回复时附带引用回复"""
 
+    reply_target_use_gender_title: bool = Field(
+        default=True,
+        json_schema_extra={
+            "label": {
+                "zh_CN": "按性别提供建议称呼",
+                "en_US": "Use gender-based suggested title",
+                "ja_JP": "性別に応じた推奨呼称を使う",
+            },
+            "x-widget": "switch",
+            "x-icon": "users",
+            "advanced": True,
+        },
+    )
+    """是否在回复对象摘要中根据性别提供建议称呼"""
+
+    reply_target_male_title: str = Field(
+        default="哥哥",
+        json_schema_extra={
+            "label": {
+                "zh_CN": "男性建议称呼",
+                "en_US": "Suggested title for male",
+                "ja_JP": "男性向け推奨呼称",
+            },
+            "x-widget": "input",
+            "x-icon": "user",
+            "advanced": True,
+        },
+    )
+    """当回复对象性别为男时使用的建议称呼"""
+
+    reply_target_female_title: str = Field(
+        default="姐姐",
+        json_schema_extra={
+            "label": {
+                "zh_CN": "女性建议称呼",
+                "en_US": "Suggested title for female",
+                "ja_JP": "女性向け推奨呼称",
+            },
+            "x-widget": "input",
+            "x-icon": "user-round",
+            "advanced": True,
+        },
+    )
+    """当回复对象性别为女时使用的建议称呼"""
+
+    reply_target_include_unknown_gender_title_hint: bool = Field(
+        default=True,
+        json_schema_extra={
+            "label": {
+                "zh_CN": "未知性别时提示中性称呼",
+                "en_US": "Hint neutral title for unknown gender",
+                "ja_JP": "性別不明時に中立呼称を促す",
+            },
+            "x-widget": "switch",
+            "x-icon": "message-circle-warning",
+            "advanced": True,
+        },
+    )
+    """当性别未知时，是否输出使用中性称呼的提示"""
+
+    reply_target_unknown_gender_title_hint: str = Field(
+        default="使用中性称呼，避免直接叫哥哥或姐姐",
+        json_schema_extra={
+            "label": {
+                "zh_CN": "未知性别提示文案",
+                "en_US": "Unknown gender hint text",
+                "ja_JP": "性別不明時の案内文",
+            },
+            "x-widget": "input",
+            "x-icon": "message-circle-more",
+            "advanced": True,
+        },
+    )
+    """当回复对象性别未知时使用的提示文案"""
+
     typing_speed: float = Field(
         default=1.0,
         ge=0,
