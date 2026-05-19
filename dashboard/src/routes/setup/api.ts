@@ -249,6 +249,10 @@ function upsertModel(models: ModelInfo[], model: ModelInfo): ModelInfo[] {
 export async function saveApiProviderSetupConfig(config: ApiProviderSetupConfig) {
   const modelConfig = await loadModelConfig()
   const providerName = config.provider_name.trim()
+  const normalizedBaseUrl = config.base_url.trim().replace(/\/+$/, '').toLowerCase()
+  const matchedTemplate = PROVIDER_TEMPLATES.find(
+    (template) => template.base_url.replace(/\/+$/, '').toLowerCase() === normalizedBaseUrl
+  )
 
   const apiProviders = modelConfig.api_providers || []
   const providerIndex = apiProviders.findIndex((provider) => provider.name === providerName)
@@ -256,7 +260,7 @@ export async function saveApiProviderSetupConfig(config: ApiProviderSetupConfig)
     name: providerName,
     base_url: config.base_url.trim(),
     api_key: config.api_key.trim(),
-    client_type: 'openai',
+    client_type: matchedTemplate?.client_type || 'openai',
     max_retry: 3,
     timeout: 120,
     retry_interval: 5,

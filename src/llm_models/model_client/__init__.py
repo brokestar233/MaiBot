@@ -3,6 +3,7 @@ from importlib import import_module
 from src.config.config import config_manager
 
 _CLIENT_MODULE_BY_TYPE: dict[str, str] = {
+    "anthropic": ".anthropic_client",
     "openai": ".openai_client",
     "gemini": ".gemini_client",
 }

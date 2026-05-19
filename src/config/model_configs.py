@@ -70,7 +70,7 @@ class APIProvider(ConfigBase):
             "x-icon": "settings",
         },
     )
-    """客户端类型 (可选: openai/google, 默认为openai)"""
+    """客户端类型 (可选: openai/gemini/anthropic, 默认为openai)"""
 
     auth_type: str = Field(
         default=OpenAICompatibleAuthType.BEARER.value,

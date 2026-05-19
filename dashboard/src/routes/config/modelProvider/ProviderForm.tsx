@@ -356,6 +356,7 @@ export function ProviderForm({
                       <ul className="list-disc list-inside space-y-1 text-xs">
                         <li><strong>OpenAI：</strong>兼容 OpenAI API 格式的提供商</li>
                         <li><strong>Gemini：</strong>Google Gemini 专用格式</li>
+                        <li><strong>Anthropic：</strong>Claude Messages API 原生格式</li>
                         <li>大部分第三方提供商都兼容 OpenAI 格式</li>
                       </ul>
                     </div>
@@ -379,6 +380,7 @@ export function ProviderForm({
                 <SelectContent>
                   <SelectItem value="openai">OpenAI</SelectItem>
                   <SelectItem value="gemini">Gemini</SelectItem>
+                  <SelectItem value="anthropic">Anthropic</SelectItem>
                 </SelectContent>
               </Select>
               {isUsingTemplate && (

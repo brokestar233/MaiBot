@@ -9,7 +9,7 @@ export interface ModelFetcherConfig {
   // 获取模型列表的端点（相对于 base_url）
   endpoint: string
   // 响应解析器类型
-  parser: 'openai' | 'gemini'
+  parser: 'openai' | 'gemini' | 'anthropic'
 }
 
 // 提供商模板定义
@@ -17,7 +17,7 @@ export interface ProviderTemplate {
   id: string
   name: string
   base_url: string
-  client_type: 'openai' | 'gemini'
+  client_type: 'openai' | 'gemini' | 'anthropic'
   display_name: string
   // 模型列表获取配置（可选，未配置则不支持自动获取）
   modelFetcher?: ModelFetcherConfig
@@ -136,9 +136,9 @@ export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
     id: 'anthropic',
     name: 'Anthropic',
     base_url: 'https://api.anthropic.com/v1',
-    client_type: 'openai',
+    client_type: 'anthropic',
     display_name: 'Anthropic (Claude)',
-    // Anthropic 使用不同的 API 格式，暂不支持自动获取
+    modelFetcher: { endpoint: '/models', parser: 'anthropic' },
   },
   {
     id: 'gemini',

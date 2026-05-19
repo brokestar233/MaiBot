@@ -14,7 +14,7 @@ import { fetchWithAuth } from './fetch-with-auth'
 export interface PackProvider {
   name: string
   base_url: string
-  client_type: 'openai' | 'gemini'
+  client_type: 'openai' | 'gemini' | 'anthropic'
   max_retry?: number
   timeout?: number
   retry_interval?: number

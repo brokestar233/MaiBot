@@ -23,6 +23,11 @@ logger = get_logger("webui")
 router = APIRouter(prefix="/models", tags=["models"], dependencies=[Depends(require_auth)])
 # 模型获取器配置
 MODEL_FETCHER_CONFIG = {
+    # Anthropic 原生格式
+    "anthropic": {
+        "endpoint": "/models",
+        "parser": "anthropic",
+    },
     # OpenAI 兼容格式的提供商
     "openai": {
         "endpoint": "/models",
@@ -85,6 +90,26 @@ def _parse_gemini_response(data: Dict) -> List[Dict]:
     return models
 
 
+def _parse_anthropic_response(data: Dict) -> List[Dict]:
+    """
+    解析 Anthropic 格式的模型列表响应。
+
+    格式: { "data": [{ "id": "claude-sonnet-4-5", "display_name": "Claude Sonnet 4.5", ... }] }
+    """
+    if "data" not in data or not isinstance(data["data"], list):
+        return []
+
+    return [
+        {
+            "id": model["id"],
+            "name": model.get("display_name") or model["id"],
+            "owned_by": "anthropic",
+        }
+        for model in data["data"]
+        if isinstance(model, dict) and "id" in model
+    ]
+
+
 async def _fetch_models_from_provider(
     base_url: str,
     api_key: str,
@@ -130,6 +155,12 @@ async def _fetch_models_from_provider(
     if client_type == "gemini":
         # Gemini 使用 URL 参数传递 API Key
         params["key"] = api_key
+    elif client_type == "anthropic" or parser == "anthropic":
+        headers.update(default_headers or {})
+        params.update(default_query or {})
+        if api_key:
+            headers.setdefault("x-api-key", api_key)
+        headers.setdefault("anthropic-version", "2023-06-01")
     else:
         provider = APIProvider(
             name="webui-openai-compatible-fetcher",
@@ -181,6 +212,8 @@ async def _fetch_models_from_provider(
         return _parse_openai_response(data)
     elif parser == "gemini":
         return _parse_gemini_response(data)
+    elif parser == "anthropic":
+        return _parse_anthropic_response(data)
     else:
         raise HTTPException(status_code=400, detail=f"不支持的解析器类型: {parser}")
 
@@ -214,7 +247,7 @@ def _get_provider_config(provider_name: str) -> Optional[Dict]:
 @router.get("/list")
 async def get_provider_models(
     provider_name: str = Query(..., description="提供商名称"),
-    parser: str = Query("openai", description="响应解析器类型 (openai | gemini)"),
+    parser: str = Query("openai", description="响应解析器类型 (openai | gemini | anthropic)"),
     endpoint: str = Query("/models", description="获取模型列表的端点"),
 ):
     """获取指定提供商的可用模型列表。
@@ -264,9 +297,9 @@ async def get_provider_models(
 async def get_models_by_url(
     base_url: str = Query(..., description="提供商的基础 URL"),
     api_key: str = Query(..., description="API Key"),
-    parser: str = Query("openai", description="响应解析器类型 (openai | gemini)"),
+    parser: str = Query("openai", description="响应解析器类型 (openai | gemini | anthropic)"),
     endpoint: str = Query("/models", description="获取模型列表的端点"),
-    client_type: str = Query("openai", description="客户端类型 (openai | gemini)"),
+    client_type: str = Query("openai", description="客户端类型 (openai | gemini | anthropic)"),
     auth_type: str = Query("bearer", description="鉴权方式 (bearer | header | query | none)"),
     auth_header_name: str = Query("Authorization", description="Header 鉴权名称"),
     auth_header_prefix: str = Query("Bearer", description="Header 鉴权前缀"),
@@ -296,7 +329,7 @@ async def get_models_by_url(
 async def test_provider_connection(
     base_url: str = Query(..., description="提供商的基础 URL"),
     api_key: Optional[str] = Query(None, description="API Key（可选，用于验证 Key 有效性）"),
-    client_type: str = Query("openai", description="客户端类型 (openai | gemini)"),
+    client_type: str = Query("openai", description="客户端类型 (openai | gemini | anthropic)"),
 ):
     """
     测试提供商连接状态
@@ -366,6 +399,9 @@ async def test_provider_connection(
                 if client_type == "gemini":
                     # Gemini 使用 URL 参数传递 API Key
                     params["key"] = api_key
+                elif client_type == "anthropic":
+                    headers["x-api-key"] = api_key
+                    headers["anthropic-version"] = "2023-06-01"
                 else:
                     # OpenAI 兼容格式使用 Authorization 头
                     headers["Authorization"] = f"Bearer {api_key}"

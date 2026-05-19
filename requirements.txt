@@ -1,5 +1,6 @@
 Babel>=2.17.0
 aiohttp>=3.12.14
+anthropic>=0.40.0
 certifi
 colorama>=0.4.6
 faiss-cpu>=1.11.0

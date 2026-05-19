@@ -206,12 +206,12 @@ export interface FetchModelsResponse {
 /**
  * 获取指定提供商的可用模型列表
  * @param providerName 提供商名称（在 model_config.toml 中配置的名称）
- * @param parser 响应解析器类型 ('openai' | 'gemini')
+ * @param parser 响应解析器类型 ('openai' | 'gemini' | 'anthropic')
  * @param endpoint 获取模型列表的端点（默认 '/models'）
  */
 export async function fetchProviderModels(
   providerName: string,
-  parser: 'openai' | 'gemini' = 'openai',
+  parser: 'openai' | 'gemini' | 'anthropic' = 'openai',
   endpoint: string = '/models'
 ): Promise<ApiResponse<ModelListItem[]>> {
   const params = new URLSearchParams({
