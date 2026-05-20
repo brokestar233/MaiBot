@@ -115,6 +115,10 @@ CHAT_COMPLETIONS_RESERVED_EXTRA_BODY_KEYS = {
 }
 """由当前客户端显式承载、不应再落入 `extra_body` 的字段集合。"""
 
+OPENAI_COMPAT_EXTRA_CONTENT_PROVIDER_KEY = "openai_compatible"
+OPENAI_COMPAT_REASONING_CONTENT_KEY = "reasoning_content"
+"""OpenAI 兼容工具调用附加信息中的 provider 专属推理字段。"""
+
 OpenAIStreamResponseHandler = Callable[
     [AsyncStream[ChatCompletionChunk], asyncio.Event | None],
     Coroutine[Any, Any, Tuple[APIResponse, UsageTuple | None]],
@@ -173,12 +177,15 @@ def _build_reasoning_key(api_provider: APIProvider) -> str:
     return PROVIDER_REASONING_KEYS_BY_DOMAIN.get(provider_hostname, "reasoning_content")
 
 
-def _extract_reasoning_content(message_part: Any, reasoning_key: str) -> str | None:
+def _extract_reasoning_content(message_part: Any, reasoning_key: str | None) -> str | None:
     """从 OpenAI 兼容响应对象中读取原生推理内容。
 
     不同兼容服务商对推理字段命名并不完全一致。这里集中处理字段访问，
     避免解析路径里散落 provider 特判；具体字段名由 provider 决定。
     """
+    if not isinstance(reasoning_key, str) or not reasoning_key:
+        return None
+
     native_reasoning = getattr(message_part, reasoning_key, None)
     if isinstance(native_reasoning, str) and native_reasoning:
         return native_reasoning
@@ -431,6 +438,57 @@ def _convert_assistant_tool_calls(tool_calls: List[ToolCall]) -> List[ChatComple
     return converted_tool_calls
 
 
+def _build_openai_tool_call_extra_content(reasoning_content: str | None) -> Dict[str, Any] | None:
+    """将推理内容编码到工具调用附加信息中。"""
+
+    normalized_reasoning = str(reasoning_content or "").strip()
+    if not normalized_reasoning:
+        return None
+
+    return {
+        OPENAI_COMPAT_EXTRA_CONTENT_PROVIDER_KEY: {
+            OPENAI_COMPAT_REASONING_CONTENT_KEY: normalized_reasoning,
+        }
+    }
+
+
+def _extract_openai_reasoning_from_tool_calls(tool_calls: List[ToolCall] | None) -> str | None:
+    """从工具调用附加信息中提取需要回传给兼容提供商的推理内容。"""
+
+    if not tool_calls:
+        return None
+
+    for tool_call in tool_calls:
+        if not tool_call.extra_content:
+            continue
+
+        provider_payload = tool_call.extra_content.get(OPENAI_COMPAT_EXTRA_CONTENT_PROVIDER_KEY)
+        if not isinstance(provider_payload, dict):
+            continue
+
+        reasoning_content = provider_payload.get(OPENAI_COMPAT_REASONING_CONTENT_KEY)
+        if isinstance(reasoning_content, str) and reasoning_content.strip():
+            return reasoning_content.strip()
+
+    return None
+
+
+def _attach_openai_reasoning_to_tool_calls(response: APIResponse) -> None:
+    """将本轮推理内容挂到首个工具调用，便于后续轮次回传给上游。"""
+
+    if not response.tool_calls:
+        return
+
+    extra_content = _build_openai_tool_call_extra_content(response.reasoning_content)
+    if extra_content is None:
+        return
+
+    first_tool_call = response.tool_calls[0]
+    merged_extra_content = dict(first_tool_call.extra_content or {})
+    merged_extra_content.update(extra_content)
+    first_tool_call.extra_content = merged_extra_content
+
+
 def _sanitize_messages_for_toolless_request(messages: List[Message]) -> List[Message]:
     """在无工具请求时清洗历史工具调用链，避免兼容接口拒收消息。"""
     sanitized_messages: List[Message] = []
@@ -457,7 +515,11 @@ def _sanitize_messages_for_toolless_request(messages: List[Message]) -> List[Mes
     return sanitized_messages
 
 
-def _convert_messages(messages: List[Message]) -> List[ChatCompletionMessageParam]:
+def _convert_messages(
+    messages: List[Message],
+    *,
+    reasoning_key: str,
+) -> List[ChatCompletionMessageParam]:
     """将内部消息列表转换为 OpenAI 兼容消息列表。
 
     Args:
@@ -485,13 +547,16 @@ def _convert_messages(messages: List[Message]) -> List[ChatCompletionMessagePara
             continue
 
         if message.role == RoleType.Assistant:
-            assistant_payload: ChatCompletionAssistantMessageParam = {
+            assistant_payload: Dict[str, Any] = {
                 "role": "assistant",
                 "content": None if not message.parts and message.tool_calls else _convert_text_only_message_content(message),
             }
             if message.tool_calls:
                 assistant_payload["tool_calls"] = _convert_assistant_tool_calls(message.tool_calls)
-            converted_messages.append(assistant_payload)
+                provider_reasoning_content = _extract_openai_reasoning_from_tool_calls(message.tool_calls)
+                if provider_reasoning_content:
+                    assistant_payload[reasoning_key] = provider_reasoning_content
+            converted_messages.append(cast(ChatCompletionAssistantMessageParam, assistant_payload))
             continue
 
         if message.role == RoleType.Tool:
@@ -942,6 +1007,7 @@ class _OpenAIStreamAccumulator:
 
         response.raw_data = {"model": self.model_name} if self.model_name else None
         _apply_xml_tool_call_fallback(response, self.tool_argument_parse_mode, response.raw_data)
+        _attach_openai_reasoning_to_tool_calls(response)
 
         if not response.content and not response.tool_calls:
             raise EmptyResponseException(response.raw_data)
@@ -1073,6 +1139,7 @@ def _default_normal_response_parser(
     finish_reason = getattr(resp.choices[0], "finish_reason", None)
     _log_length_truncation(finish_reason, getattr(resp, "model", None))
     _apply_xml_tool_call_fallback(api_response, tool_argument_parse_mode, resp)
+    _attach_openai_reasoning_to_tool_calls(api_response)
 
     if not api_response.content and not api_response.tool_calls:
         raise EmptyResponseException(resp)
@@ -1200,7 +1267,10 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 if request.tool_options
                 else _sanitize_messages_for_toolless_request(request.message_list)
             )
-            messages_payload: List[ChatCompletionMessageParam] = _convert_messages(request_messages)
+            messages_payload: List[ChatCompletionMessageParam] = _convert_messages(
+                request_messages,
+                reasoning_key=self.reasoning_key,
+            )
             tools_payload: List[ChatCompletionToolParam] | None = (
                 _convert_tool_options(request.tool_options) if request.tool_options else None
             )

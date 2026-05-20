@@ -39,6 +39,10 @@ from ..request_snapshot import (
 
 logger = get_logger("llm_models")
 
+ANTHROPIC_EXTRA_CONTENT_PROVIDER_KEY = "anthropic"
+ANTHROPIC_EXTRA_CONTENT_THINKING_BLOCKS_KEY = "thinking_blocks"
+"""Anthropic 工具调用附加信息中的思考块缓存字段。"""
+
 ANTHROPIC_MESSAGES_RESERVED_EXTRA_BODY_KEYS = {
     "container",
     "inference_geo",
@@ -202,11 +206,16 @@ def _convert_messages(messages: List[Message]) -> Tuple[str | None, List[Dict[st
             continue
 
         if message.role == RoleType.Assistant:
-            content_blocks = [
+            non_tool_content_blocks = [
                 _convert_part_to_content_block(part, allow_image=False)
                 for part in message.parts
             ]
-            for tool_call in message.tool_calls or []:
+            content_blocks: List[Dict[str, Any]] = []
+            tool_calls = message.tool_calls or []
+            for tool_call_index, tool_call in enumerate(tool_calls):
+                content_blocks.extend(_extract_anthropic_thinking_blocks(tool_call))
+                if tool_call_index == 0:
+                    content_blocks.extend(non_tool_content_blocks)
                 content_blocks.append(
                     {
                         "type": "tool_use",
@@ -215,6 +224,8 @@ def _convert_messages(messages: List[Message]) -> Tuple[str | None, List[Dict[st
                         "input": tool_call.args or {},
                     }
                 )
+            if not tool_calls:
+                content_blocks.extend(non_tool_content_blocks)
             converted_messages.append(
                 {
                     "role": "assistant",
@@ -247,6 +258,93 @@ def _convert_messages(messages: List[Message]) -> Tuple[str | None, List[Dict[st
     return system_prompt, converted_messages
 
 
+def _build_anthropic_thinking_block(block: Any) -> Dict[str, Any] | None:
+    """将 Anthropic thinking/redacted_thinking block 规范化为可回传结构。"""
+
+    block_type = getattr(block, "type", None)
+    if block_type == "thinking":
+        signature = getattr(block, "signature", None)
+        thinking = getattr(block, "thinking", None)
+        payload: Dict[str, Any] = {
+            "type": "thinking",
+            "thinking": thinking if isinstance(thinking, str) else "",
+        }
+        if isinstance(signature, str) and signature:
+            payload["signature"] = signature
+        return payload
+
+    if block_type == "redacted_thinking":
+        data = getattr(block, "data", None)
+        if isinstance(data, str) and data:
+            return {
+                "type": "redacted_thinking",
+                "data": data,
+            }
+
+    return None
+
+
+def _build_anthropic_tool_call_extra_content(thinking_blocks: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    """将 Anthropic 思考块列表编码到工具调用附加信息中。"""
+
+    if not thinking_blocks:
+        return None
+
+    normalized_blocks = [dict(thinking_block) for thinking_block in thinking_blocks if isinstance(thinking_block, dict)]
+    if not normalized_blocks:
+        return None
+
+    return {
+        ANTHROPIC_EXTRA_CONTENT_PROVIDER_KEY: {
+            ANTHROPIC_EXTRA_CONTENT_THINKING_BLOCKS_KEY: normalized_blocks,
+        }
+    }
+
+
+def _extract_anthropic_thinking_blocks(tool_call: ToolCall) -> List[Dict[str, Any]]:
+    """从工具调用附加信息中提取 Anthropic thinking block。"""
+
+    if not tool_call.extra_content:
+        return []
+
+    provider_payload = tool_call.extra_content.get(ANTHROPIC_EXTRA_CONTENT_PROVIDER_KEY)
+    if not isinstance(provider_payload, dict):
+        return []
+
+    raw_thinking_blocks = provider_payload.get(ANTHROPIC_EXTRA_CONTENT_THINKING_BLOCKS_KEY)
+    if not isinstance(raw_thinking_blocks, list):
+        return []
+
+    normalized_blocks: List[Dict[str, Any]] = []
+    for raw_thinking_block in raw_thinking_blocks:
+        if not isinstance(raw_thinking_block, dict):
+            continue
+
+        block_type = str(raw_thinking_block.get("type") or "").strip()
+        if block_type == "thinking":
+            normalized_block: Dict[str, Any] = {
+                "type": "thinking",
+                "thinking": str(raw_thinking_block.get("thinking") or ""),
+            }
+            signature = raw_thinking_block.get("signature")
+            if isinstance(signature, str) and signature:
+                normalized_block["signature"] = signature
+            normalized_blocks.append(normalized_block)
+            continue
+
+        if block_type == "redacted_thinking":
+            data = raw_thinking_block.get("data")
+            if isinstance(data, str) and data:
+                normalized_blocks.append(
+                    {
+                        "type": "redacted_thinking",
+                        "data": data,
+                    }
+                )
+
+    return normalized_blocks
+
+
 def _extract_usage_record(raw_usage: Any) -> UsageTuple | None:
     if raw_usage is None:
         return None
@@ -272,6 +370,7 @@ def _default_response_parser(resp: Any) -> Tuple[APIResponse, UsageTuple | None]
     text_blocks: List[str] = []
     reasoning_blocks: List[str] = []
     tool_calls: List[ToolCall] = []
+    pending_thinking_blocks: List[Dict[str, Any]] = []
 
     for block in getattr(resp, "content", []) or []:
         block_type = getattr(block, "type", None)
@@ -281,6 +380,11 @@ def _default_response_parser(resp: Any) -> Tuple[APIResponse, UsageTuple | None]
                 text_blocks.append(text)
             continue
 
+        if block_type in {"thinking", "redacted_thinking"}:
+            thinking_block = _build_anthropic_thinking_block(block)
+            if thinking_block is not None:
+                pending_thinking_blocks.append(thinking_block)
+
         if block_type == "thinking":
             thinking = getattr(block, "thinking", None)
             if isinstance(thinking, str) and thinking:
@@ -288,13 +392,16 @@ def _default_response_parser(resp: Any) -> Tuple[APIResponse, UsageTuple | None]
             continue
 
         if block_type in {"tool_use", "server_tool_use"}:
+            extra_content = _build_anthropic_tool_call_extra_content(pending_thinking_blocks)
             tool_calls.append(
                 ToolCall(
                     call_id=str(getattr(block, "id", None) or _build_fallback_tool_call_id("tool_use")),
                     func_name=str(getattr(block, "name", "") or ""),
                     args=cast(Dict[str, Any] | None, getattr(block, "input", None)),
+                    extra_content=extra_content,
                 )
             )
+            pending_thinking_blocks = []
 
     response.content = "".join(text_blocks).strip() or None
     response.reasoning_content = "\n\n".join(reasoning_blocks).strip() or None

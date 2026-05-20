@@ -4,8 +4,11 @@ import pytest
 
 from src.config.model_configs import APIProvider, ReasoningParseMode, ToolArgumentParseMode
 from src.llm_models.model_client.openai_client import (
+    OPENAI_COMPAT_EXTRA_CONTENT_PROVIDER_KEY,
+    OPENAI_COMPAT_REASONING_CONTENT_KEY,
     _OpenAIStreamAccumulator,
     _build_reasoning_key,
+    _convert_messages,
     _default_normal_response_parser,
     _parse_tool_arguments,
     _sanitize_messages_for_toolless_request,
@@ -162,3 +165,65 @@ def test_stream_accumulator_reads_openrouter_reasoning_delta_field() -> None:
 
     assert api_response.content == "正式回复"
     assert api_response.reasoning_content == "流式推理"
+
+
+def test_normal_response_parser_attaches_reasoning_to_first_tool_call_extra_content() -> None:
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="tool_calls",
+                message=SimpleNamespace(
+                    content=None,
+                    reasoning_content="推理内容",
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="call_1",
+                            type="function",
+                            function=SimpleNamespace(name="finish", arguments="{}"),
+                        )
+                    ],
+                ),
+            )
+        ],
+        usage=None,
+        model="deepseek-reasoner",
+    )
+
+    api_response, _ = _default_normal_response_parser(
+        response,
+        reasoning_parse_mode=ReasoningParseMode.AUTO,
+        tool_argument_parse_mode=ToolArgumentParseMode.AUTO,
+        reasoning_key="reasoning_content",
+    )
+
+    assert api_response.reasoning_content == "推理内容"
+    assert api_response.tool_calls is not None
+    assert api_response.tool_calls[0].extra_content == {
+        OPENAI_COMPAT_EXTRA_CONTENT_PROVIDER_KEY: {
+            OPENAI_COMPAT_REASONING_CONTENT_KEY: "推理内容",
+        }
+    }
+
+
+def test_convert_messages_roundtrips_provider_reasoning_field_from_tool_call_extra_content() -> None:
+    assistant_message = Message(
+        role=RoleType.Assistant,
+        tool_calls=[
+            ToolCall(
+                call_id="call_1",
+                func_name="finish",
+                args={},
+                extra_content={
+                    OPENAI_COMPAT_EXTRA_CONTENT_PROVIDER_KEY: {
+                        OPENAI_COMPAT_REASONING_CONTENT_KEY: "推理内容",
+                    }
+                },
+            )
+        ],
+    )
+
+    converted_messages = _convert_messages([assistant_message], reasoning_key="reasoning_content")
+
+    assert converted_messages[0]["role"] == "assistant"
+    assert converted_messages[0]["content"] is None
+    assert converted_messages[0]["reasoning_content"] == "推理内容"
