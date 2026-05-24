@@ -13,7 +13,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from src.chat.message_receive.chat_manager import BotChatSession
-from src.chat.message_receive.message import SessionMessage
+from src.chat.message_receive.message import build_reply_target_person_summary_from_message, SessionMessage
 from src.chat.utils.utils import get_chat_type_and_target_info
 from src.cli.console import console
 from src.common.data_models.llm_service_data_models import LLMGenerationOptions
@@ -158,6 +158,7 @@ class BaseMaisakaReplyGenerator:
         target_time = reply_message.timestamp.strftime("%Y-%m-%d %H:%M:%S")
         quote_ids = extract_quote_ids_from_message_sequence(reply_message.raw_message)
         target_content = self._normalize_content(self._build_target_message_content(reply_message), limit=300)
+        target_person_summary = build_reply_target_person_summary_from_message(reply_message)
         if not target_content:
             target_content = "[无可见文本内容]"
 
@@ -172,6 +173,12 @@ class BaseMaisakaReplyGenerator:
                 f"- 时间：{target_time}",
                 f"- 用户名：{sender_name}",
                 f"- 发言内容：{target_content}",
+            ]
+        )
+        if target_person_summary:
+            target_lines.append(f"- 回复对象信息：{target_person_summary}")
+        target_lines.extend(
+            [
                 "",
                 "你这次要回复的就是这条目标消息，请结合整段上下文理解，但不要把其他历史消息当成当前回复对象。",
             ]

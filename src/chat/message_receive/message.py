@@ -166,6 +166,30 @@ def _extract_reply_target_age_from_message_config(message_config: object) -> str
     return ""
 
 
+def build_reply_target_person_summary_from_message(message: "SessionMessage") -> str:
+    """从目标消息直接构造回复对象摘要。
+
+    该函数用于 replyer 在生成阶段读取目标消息人物信息，
+    避免把性别/建议称呼等注入能力绑定到 ``ReplyComponent`` 是否存在。
+    """
+
+    additional_config = message.message_info.additional_config
+    normalized_additional_config = additional_config if isinstance(additional_config, dict) else {}
+    reply_target_gender = _extract_reply_target_gender_from_message_config(normalized_additional_config)
+    reply_target_age = _extract_reply_target_age_from_message_config(normalized_additional_config)
+    user_info = message.message_info.user_info
+    group_info = message.message_info.group_info
+    return _build_reply_target_person_summary(
+        platform=message.platform,
+        user_id=user_info.user_id,
+        user_nickname=user_info.user_nickname,
+        user_cardname=user_info.user_cardname,
+        group_id=group_info.group_id if group_info is not None else None,
+        gender=reply_target_gender,
+        age=reply_target_age,
+    )
+
+
 class MsgIDMapping:
     """回复消息内容缓存。"""
 
