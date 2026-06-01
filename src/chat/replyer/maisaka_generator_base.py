@@ -31,6 +31,7 @@ from src.common.data_models.reply_generation_data_models import (
     ReplyGenerationResult,
     build_reply_monitor_detail,
 )
+from src.common.i18n import get_locale
 from src.common.logger import get_logger
 from src.common.utils.utils_config import ChatConfigUtils
 from src.config.config import global_config
@@ -48,7 +49,8 @@ from src.maisaka.context_messages import (
 from src.maisaka.display.prompt_cli_renderer import PromptCLIVisualizer
 from src.maisaka.message_adapter import parse_speaker_content
 from src.maisaka.planner_message_utils import extract_quote_ids_from_message_sequence
-from src.plugin_runtime.hook_payloads import serialize_prompt_messages
+from src.maisaka.visual_message_limiter import limit_latest_images_in_messages
+from src.plugin_runtime.hook_payloads import deserialize_prompt_messages, serialize_prompt_messages
 
 from .maisaka_expression_selector import maisaka_expression_selector
 
@@ -257,15 +259,70 @@ class BaseMaisakaReplyGenerator:
         return "在该聊天中的注意事项：\n" + "\n\n".join(prompt_lines) + "\n"
 
     @staticmethod
-    def _build_replyer_at_block() -> str:
-        """构建 replyer 模式下的 at 标记说明。"""
+    def _get_prompt_locale() -> str:
+        """获取当前 prompt 语言。"""
 
-        if not global_config.chat.enable_at:
-            return ""
+        try:
+            return get_locale().lower()
+        except Exception:
+            return "zh-cn"
+
+    @staticmethod
+    def _build_replyer_output_instruction() -> str:
+        """构建 replyer 的最终输出格式说明。"""
+
+        locale = BaseMaisakaReplyGenerator._get_prompt_locale()
+        if not getattr(global_config.chat, "enable_replyer_format_output", False):
+            if locale.startswith("en"):
+                return (
+                    "Please do not output any extra content (including unnecessary prefixes or suffixes, "
+                    "colons, brackets, stickers, plain at, or @). Only output the message content itself."
+                )
+            if locale.startswith("ja"):
+                return (
+                    "余計な内容（不要な前置きや後置き、コロン、括弧、スタンプ、通常の at や @ など）は出力せず、"
+                    "発言内容だけを出力してください。"
+                )
+            return (
+                "请注意不要输出多余内容(包括不必要的前后缀，冒号，括号，表情包，@等 )，"
+                "只输出发言内容就好。"
+            )
+
+        if locale.startswith("en"):
+            return (
+                "Only output the message fragments to send. Do not output explanations, Markdown, or code fences. "
+                "Use `<text>text</text>` for normal text; "
+                "to mention someone, use `<at msg_id=\"message id\">display name</at>`; "
+                "use `<emoji>emotion or sticker description</emoji>` when you want to send a sticker. "
+                "To resend an existing image from context, use "
+                "`<image msg_id=\"message id\" index=\"0\">optional description</image>`; "
+                "for tool-result media, use `media_index=\"tool_result:call_x:0\"` instead of `msg_id`. "
+                "You may combine fragments in send order, for example: "
+                "`<text>fine</text><image msg_id=\"123\" index=\"0\">that image</image>`."
+            )
+
+        if locale.startswith("ja"):
+            return (
+                "送信するメッセージフラグメントだけを出力してください。説明、Markdown、コードブロックは出力しないでください。"
+                "通常の文字は `<text>文字</text>` を使います；"
+                "`<at msg_id=\"メッセージID\">表示名</at>` で at できます；"
+                "スタンプを送りたいときは `<emoji>感情またはスタンプ説明</emoji>` を使います。"
+                "文脈中の既存画像を送りたいときは "
+                "`<image msg_id=\"メッセージID\" index=\"0\">任意の説明</image>` を使います。"
+                "ツール結果のメディアは `msg_id` の代わりに `media_index=\"tool_result:call_x:0\"` を使います。"
+                "送信順に複数のフラグメントを組み合わせてもかまいません。例："
+                "`<text>まあいいか</text><image msg_id=\"123\" index=\"0\">その画像</image>`。"
+            )
+
         return (
-            "如果需要提及某人、让某人关注你的回复，可以在回复中加入 `at[msg_id]` 标记，"
-            "其中 msg_id 应使用聊天记录中该用户发过的消息编号；"
-            "消息发送时会检查这种标记并转换为真正的 at 消息。\n"
+            "请只输出要发送的消息片段，不要输出解释、Markdown 或代码块。"
+            "普通文字使用 `<text>文字</text>`；"
+            "需要 at 某人时，使用 `<at msg_id=\"消息编号\">显示名</at>`；"
+            "想发送表情包时，使用 `<emoji>情绪或表情描述</emoji>`。"
+            "想转发上下文里已有图片时，使用 `<image msg_id=\"消息编号\" index=\"0\">可选描述</image>`。"
+            "工具返回媒体用 `media_index=\"tool_result:call_x:0\"` 代替 `msg_id`。"
+            "可以按发送顺序组合多个片段，例如："
+            "`<text>行吧</text><image msg_id=\"123\" index=\"0\">那张图</image>`。"
         )
 
     @staticmethod
@@ -382,7 +439,7 @@ class BaseMaisakaReplyGenerator:
                 "maisaka_replyer",
                 bot_name=global_config.bot.nickname,
                 group_chat_attention_block=self._build_group_chat_attention_block(session_id),
-                replyer_at_block=self._build_replyer_at_block(),
+                replyer_output_instruction=self._build_replyer_output_instruction(),
                 identity=self._build_personality_prompt(),
                 reply_style=self._select_reply_style(),
             )
@@ -392,6 +449,8 @@ class BaseMaisakaReplyGenerator:
         return system_prompt
 
     def _build_reply_instruction(self) -> str:
+        if getattr(global_config.chat, "enable_replyer_format_output", False):
+            return self._build_replyer_output_instruction()
         return "请自然地回复。不要输出多余说明、括号、@ 或额外标记，只输出实际要发送的内容。"
 
     def _build_final_user_message(
@@ -490,7 +549,63 @@ class BaseMaisakaReplyGenerator:
         messages.append(MessageBuilder().set_role(RoleType.System).add_text_content(system_prompt).build())
         messages.extend(self._build_history_messages(chat_history, enable_visual_message))
         messages.append(MessageBuilder().set_role(RoleType.User).add_text_content(final_user_message).build())
+        if enable_visual_message:
+            return limit_latest_images_in_messages(
+                messages,
+                max_image_num=global_config.visual.max_image_num,
+            )
         return messages
+
+    async def _invoke_before_model_request_hook(
+        self,
+        *,
+        request_messages: List[Message],
+        session_id: str,
+        active_task_name: str,
+        active_model_name: Optional[str],
+        model_info: Optional[ModelInfo],
+        attempt: int,
+        retry_count: int,
+        reply_message: Optional[SessionMessage],
+        reply_reason: str,
+        reference_info: str,
+        selected_expression_ids: List[int],
+        reply_tool_args: Dict[str, Any],
+    ) -> List[Message]:
+        """触发 replyer 模型请求前 Hook，允许插件改写最终 messages。"""
+
+        try:
+            hook_result = await self._get_runtime_manager().invoke_hook(
+                "maisaka.replyer.before_model_request",
+                messages=serialize_prompt_messages(request_messages),
+                session_id=session_id,
+                request_type=self.request_type,
+                task_name=active_task_name,
+                requested_model_name=active_model_name or "",
+                selected_model_name=str(getattr(model_info, "name", "") or ""),
+                selected_model_visual=bool(getattr(model_info, "visual", False)),
+                attempt=attempt,
+                retry_count=retry_count,
+                max_retries=REPLYER_MAX_HOOK_RETRIES,
+                reply_message_id=str(reply_message.message_id if reply_message is not None else ""),
+                reply_reason=reply_reason or "",
+                reference_info=reference_info,
+                selected_expression_ids=list(selected_expression_ids),
+                reply_tool_args=dict(reply_tool_args),
+            )
+        except Exception as exc:
+            logger.warning(f"Maisaka 回复器 before_model_request Hook 调用失败，将继续使用当前请求消息: {exc}")
+            return request_messages
+
+        raw_messages = hook_result.kwargs.get("messages")
+        if not isinstance(raw_messages, list):
+            return request_messages
+
+        try:
+            return deserialize_prompt_messages(raw_messages)
+        except Exception as exc:
+            logger.warning(f"Hook maisaka.replyer.before_model_request 返回的 messages 无法反序列化，已忽略: {exc}")
+            return request_messages
 
     def _resolve_enable_visual_message(self, model_info: Optional[ModelInfo] = None) -> bool:
         if self._enable_visual_message is not None:
@@ -795,14 +910,19 @@ class BaseMaisakaReplyGenerator:
             prompt_ms = round((time.perf_counter() - prompt_started_at) * 1000, 2)
             prompt_preview = PromptCLIVisualizer._build_prompt_dump_text(request_messages)
 
-            def message_factory(
+            async def message_factory(
                 _client: object,
                 model_info: Optional[ModelInfo] = None,
                 reference_info_for_attempt: str = active_reference_info,
+                active_task_name_for_attempt: str = active_task_name,
+                active_model_name_for_attempt: Optional[str] = active_model_name,
+                retry_count_for_attempt: int = retry_count,
+                selected_expression_ids_for_attempt: tuple[int, ...] = tuple(result.selected_expression_ids),
+                reply_tool_args_for_attempt: tuple[tuple[str, Any], ...] = tuple(active_reply_tool_args.items()),
             ) -> List[Message]:
                 nonlocal prompt_ms, prompt_preview, request_messages
                 prompt_started_at = time.perf_counter()
-                request_messages = self._build_request_messages(
+                built_request_messages = self._build_request_messages(
                     chat_history=filtered_history,
                     reply_message=reply_message,
                     reply_reason=reply_reason or "",
@@ -810,6 +930,20 @@ class BaseMaisakaReplyGenerator:
                     expression_habits=merged_expression_habits,
                     stream_id=stream_id,
                     enable_visual_message=self._resolve_enable_visual_message(model_info),
+                )
+                request_messages = await self._invoke_before_model_request_hook(
+                    request_messages=built_request_messages,
+                    session_id=preview_chat_id,
+                    active_task_name=active_task_name_for_attempt,
+                    active_model_name=active_model_name_for_attempt,
+                    model_info=model_info,
+                    attempt=retry_count_for_attempt + 1,
+                    retry_count=retry_count_for_attempt,
+                    reply_message=reply_message,
+                    reply_reason=reply_reason or "",
+                    reference_info=reference_info_for_attempt,
+                    selected_expression_ids=list(selected_expression_ids_for_attempt),
+                    reply_tool_args=dict(reply_tool_args_for_attempt),
                 )
                 prompt_ms = round((time.perf_counter() - prompt_started_at) * 1000, 2)
                 prompt_preview = PromptCLIVisualizer._build_prompt_dump_text(request_messages)
@@ -971,6 +1105,10 @@ class BaseMaisakaReplyGenerator:
                     request_kind="replyer",
                     selection_reason=f"ID: {preview_chat_id}",
                     output_content=response_text,
+                    metadata={
+                        "model_name": generation_result.model_name or "",
+                        "duration_ms": llm_ms,
+                    },
                 ),
                 title="Reply Prompt",
                 border_style="bright_yellow",

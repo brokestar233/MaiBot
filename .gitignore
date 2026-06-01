@@ -35,6 +35,7 @@ NapCat.Shell.Windows.OneKey
 run_amds.bat
 run_none.bat
 docs-mai/
+plugin_repo/
 run.py
 queue_update.txt
 start_saka.bat
@@ -61,6 +62,9 @@ node_modules/
 dist/
 dist-ssr/
 *.local
+
+# Custom MaiBot config for Docker Deployments
+docker-config/
 
 # Editor directories and files
 .vscode/*
@@ -98,6 +102,12 @@ parts/
 sdist/
 var/
 wheels/
+
+# Dev container config
+.devcontainer/devcontainer-lock.json
+# DooD 自动生成的 compose override，包含宿主机绝对路径，不可提交；仅在 devcontainer 内通过 COMPOSE_FILE 加载
+docker-compose.devcontainer.yml
+
 share/python-wheels/
 *.egg-info/
 .installed.cfg
@@ -206,7 +216,7 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-.venv
+.venv/
 env/
 venv/
 ENV/

@@ -2,7 +2,9 @@ import * as React from "react"
 import * as LucideIcons from "lucide-react"
 import { useTranslation } from "react-i18next"
 
+import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { DraftNumberInput } from "@/components/ui/draft-number-input"
 import { KeyValueEditor } from "@/components/ui/key-value-editor"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
@@ -64,6 +66,8 @@ const parsePrimitiveArrayDraft = (draftValue: string, itemType: string) => {
       return line
     })
 }
+
+const formatNumericValue = (value: number) => String(value)
 
 function PrimitiveArrayEditor({
   onChange,
@@ -154,6 +158,29 @@ export const DynamicField: React.FC<DynamicFieldProps> = ({
 
     return 0
   }
+
+  const normalizeNumericValue = (nextValue: number, minValue?: number, maxValue?: number) => {
+    let normalizedValue = schema.type === 'integer' ? Math.trunc(nextValue) : nextValue
+
+    if (typeof minValue === 'number' && Number.isFinite(minValue)) {
+      normalizedValue = Math.max(minValue, normalizedValue)
+    }
+    if (typeof maxValue === 'number' && Number.isFinite(maxValue)) {
+      normalizedValue = Math.min(maxValue, normalizedValue)
+    }
+
+    return normalizedValue
+  }
+
+  const numericValue = parseNumericValue(value, schema.default)
+  const [sliderDraftValue, setSliderDraftValue] = React.useState(() => formatNumericValue(numericValue))
+  const sliderInputFocusedRef = React.useRef(false)
+
+  React.useEffect(() => {
+    if (!sliderInputFocusedRef.current) {
+      setSliderDraftValue(formatNumericValue(numericValue))
+    }
+  }, [numericValue])
 
   const renderPrimitiveArrayEditor = () => {
     return <PrimitiveArrayEditor schema={schema} value={value} onChange={onChange} />
@@ -279,6 +306,8 @@ export const DynamicField: React.FC<DynamicFieldProps> = ({
           return renderTextInput('password')
         case 'switch':
           return renderSwitch()
+        case 'talk-time':
+          return renderTalkTimeInput()
         case 'textarea':
           return renderTextarea()
         case 'select':
@@ -357,20 +386,66 @@ export const DynamicField: React.FC<DynamicFieldProps> = ({
    * 渲染 Slider 组件（用于 number 类型 + x-widget: slider）
    */
   const renderSlider = () => {
-    const numValue = parseNumericValue(value, schema.default)
+    const numValue = numericValue
     const min = schema.minValue ?? 0
     const max = schema.maxValue ?? 100
     const step = schema.step ?? 1
 
+    const commitSliderDraftValue = (nextDraftValue: string) => {
+      setSliderDraftValue(nextDraftValue)
+
+      if (!nextDraftValue.trim()) {
+        return
+      }
+
+      const parsedValue = Number(nextDraftValue)
+      if (!Number.isFinite(parsedValue)) {
+        return
+      }
+
+      onChange(normalizeNumericValue(parsedValue, min, max))
+    }
+
+    const canonicalizeSliderDraftValue = () => {
+      sliderInputFocusedRef.current = false
+
+      const parsedValue = Number(sliderDraftValue)
+      if (!Number.isFinite(parsedValue)) {
+        setSliderDraftValue(formatNumericValue(numValue))
+        return
+      }
+
+      const nextValue = normalizeNumericValue(parsedValue, min, max)
+      onChange(nextValue)
+      setSliderDraftValue(formatNumericValue(nextValue))
+    }
+
     return (
       <div className="min-w-0 space-y-2">
-        <Slider
-          value={[numValue]}
-          onValueChange={(values) => onChange(values[0])}
-          min={min}
-          max={max}
-          step={step}
-        />
+        <div className="flex min-w-0 items-center gap-3">
+          <Slider
+            value={[numValue]}
+            onValueChange={(values) => onChange(values[0])}
+            min={min}
+            max={max}
+            step={step}
+            className="min-w-0 flex-1"
+          />
+          <Input
+            aria-label={`${fieldLabel} 数值`}
+            type="number"
+            value={sliderDraftValue}
+            onBlur={canonicalizeSliderDraftValue}
+            onChange={(event) => commitSliderDraftValue(event.target.value)}
+            onFocus={() => {
+              sliderInputFocusedRef.current = true
+            }}
+            min={min}
+            max={max}
+            step={step}
+            className="h-8 w-24 shrink-0 text-right"
+          />
+        </div>
         <div className="flex justify-between text-xs text-muted-foreground">
           <span>{min}</span>
           <span className="font-medium text-foreground">{numValue}</span>
@@ -384,21 +459,16 @@ export const DynamicField: React.FC<DynamicFieldProps> = ({
    * 渲染 Input[type="number"] 组件（用于 number/integer 类型）
    */
   const renderNumberInput = () => {
-    const numValue = parseNumericValue(value, schema.default)
     const min = schema.minValue
     const max = schema.maxValue
     const step = schema.step ?? (schema.type === 'integer' ? 1 : 0.1)
 
     return (
-      <Input
-        type="number"
-        value={numValue}
-        onChange={(e) => {
-          const nextValue = schema.type === 'integer'
-            ? parseInt(e.target.value, 10)
-            : parseFloat(e.target.value)
-          onChange(Number.isFinite(nextValue) ? nextValue : 0)
-        }}
+      <DraftNumberInput
+        value={value}
+        defaultValue={schema.default}
+        integer={schema.type === 'integer'}
+        onValueChange={(nextValue) => onChange(nextValue)}
         min={min}
         max={max}
         step={step}
@@ -422,6 +492,64 @@ export const DynamicField: React.FC<DynamicFieldProps> = ({
         value={strValue}
         onChange={(e) => onChange(e.target.value)}
       />
+    )
+  }
+
+  const renderTalkTimeInput = () => {
+    const strValue =
+      typeof value === 'string'
+        ? value
+        : value === null || value === undefined
+          ? String(schema.default ?? '')
+          : String(value)
+    const trimmedValue = strValue.trim()
+    const mode =
+      trimmedValue === ''
+        ? 'fallback'
+        : trimmedValue === '*'
+          ? 'always'
+          : 'range'
+    const rangeValue = mode === 'range' ? strValue : ''
+
+    const selectFallback = () => onChange('')
+    const selectRange = () => onChange(mode === 'range' ? strValue : '00:00-23:59')
+    const selectAlways = () => onChange('*')
+
+    return (
+      <div className="space-y-2">
+        <div className="grid grid-cols-3 gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant={mode === 'fallback' ? 'default' : 'outline'}
+            onClick={selectFallback}
+          >
+            兜底
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={mode === 'range' ? 'default' : 'outline'}
+            onClick={selectRange}
+          >
+            时间段
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={mode === 'always' ? 'default' : 'outline'}
+            onClick={selectAlways}
+          >
+            *
+          </Button>
+        </div>
+        <Input
+          value={rangeValue}
+          disabled={mode !== 'range'}
+          placeholder="HH:MM-HH:MM"
+          onChange={(event) => onChange(event.target.value)}
+        />
+      </div>
     )
   }
 

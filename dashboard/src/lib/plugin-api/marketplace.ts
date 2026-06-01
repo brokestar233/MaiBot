@@ -1,5 +1,5 @@
 import type { ApiResponse } from '@/types/api'
-import type { PluginInfo } from '@/types/plugin'
+import type { PluginInfo, PluginType } from '@/types/plugin'
 
 import { fetchWithAuth } from '@/lib/fetch-with-auth'
 import { parseResponse } from '@/lib/api-helpers'
@@ -15,6 +15,18 @@ const PLUGIN_REPO_BRANCH = 'main'
 const PLUGIN_DETAILS_FILE = 'plugin_details.json'
 const PLUGIN_LIST_CACHE_TTL = 5 * 60 * 1000
 const PLUGIN_LIST_STORAGE_KEY = 'maibot-plugin-market-list-cache'
+const PLUGIN_TYPES = new Set<PluginType>([
+  'adapter',
+  'tool',
+  'provider',
+  'management',
+  'data',
+  'media',
+  'game',
+  'integration',
+  'extension',
+  'other',
+])
 
 let pluginListCache: { timestamp: number; result: ApiResponse<PluginInfo[]> } | null = null
 let pluginListRequest: Promise<ApiResponse<PluginInfo[]>> | null = null
@@ -53,7 +65,8 @@ interface PluginApiResponse {
       issues?: string
     }
     keywords: string[]
-    categories?: string[]
+    plugin_type?: string
+    display?: PluginInfo['manifest']['display']
     default_locale: string
     locales_path?: string
   }
@@ -63,6 +76,14 @@ interface PluginApiResponse {
 
 function uniqueNonEmptyValues(values: Array<string | undefined>): string[] {
   return Array.from(new Set(values.map(value => value?.trim()).filter((value): value is string => Boolean(value))))
+}
+
+function normalizePluginType(value: unknown): PluginType {
+  if (typeof value === 'string' && PLUGIN_TYPES.has(value as PluginType)) {
+    return value as PluginType
+  }
+
+  return 'extension'
 }
 
 function normalizePluginManifest(manifest: PluginApiResponse['manifest']): PluginInfo['manifest'] {
@@ -82,10 +103,23 @@ function normalizePluginManifest(manifest: PluginApiResponse['manifest']): Plugi
     repository_url: repositoryUrl,
     urls: manifest.urls,
     keywords: manifest.keywords || [],
-    categories: manifest.categories || [],
+    plugin_type: normalizePluginType(manifest.plugin_type),
+    display: manifest.display,
     default_locale: manifest.default_locale || 'zh-CN',
     locales_path: manifest.locales_path,
   }
+}
+
+function normalizeDateString(value: unknown): string {
+  if (typeof value === 'string') {
+    return value
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return new Date(value).toISOString()
+  }
+
+  return ''
 }
 
 function readPluginListStorageCache(): PluginListStorageCache | null {
@@ -194,7 +228,7 @@ async function fetchPluginListUncached(): Promise<ApiResponse<PluginInfo[]>> {
       }
       return true
     })
-    .map((item) => {
+    .map((item, index) => {
       const manifestId = item.manifest.id?.trim()
       const marketplaceId = item.id?.trim()
       const pluginId = manifestId || marketplaceId!
@@ -202,6 +236,7 @@ async function fetchPluginListUncached(): Promise<ApiResponse<PluginInfo[]>> {
       return {
         id: pluginId,
         marketplace_id: marketplaceId,
+        marketplace_order: index,
         stats_ids: uniqueNonEmptyValues([manifestId]),
         manifest: normalizePluginManifest({ ...item.manifest, id: pluginId }),
         downloads: 0,
@@ -209,8 +244,8 @@ async function fetchPluginListUncached(): Promise<ApiResponse<PluginInfo[]>> {
         review_count: 0,
         installed: false,
         source: 'market' as const,
-        published_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
+        published_at: normalizeDateString(item.published_at ?? item.created_at ?? item.added_at),
+        updated_at: normalizeDateString(item.updated_at ?? item.modified_at),
       }
     })
   

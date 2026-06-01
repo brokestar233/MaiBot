@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 import asyncio
 import inspect
@@ -60,6 +60,11 @@ DATA_URI_LIMIT_PATTERN = re.compile(
 )
 DATA_URI_RETRY_MARGIN_BYTES = 128 * 1024
 MIN_COMPRESSED_IMAGE_TARGET_SIZE_BYTES = 512 * 1024
+EMPTY_TASK_FALLBACKS = {
+    "learner": "utils",
+    "mid_memory": "planner",
+    "timing_gate": "planner",
+}
 
 
 class RequestType(Enum):
@@ -112,10 +117,12 @@ class LLMOrchestrator:
         task_config = getattr(model_task_config, self.task_name, None)
         if not isinstance(task_config, TaskConfig):
             raise ValueError(f"未找到名为 '{self.task_name}' 的任务配置")
-        if self.task_name == "learner" and not any(str(model_name).strip() for model_name in task_config.model_list):
-            fallback_task_config = getattr(model_task_config, "utils", None)
-            if isinstance(fallback_task_config, TaskConfig):
-                return fallback_task_config
+        if not any(str(model_name).strip() for model_name in task_config.model_list):
+            fallback_task_name = EMPTY_TASK_FALLBACKS.get(self.task_name, "")
+            if fallback_task_name:
+                fallback_task_config = getattr(model_task_config, fallback_task_name, None)
+                if isinstance(fallback_task_config, TaskConfig):
+                    return fallback_task_config
         return task_config
 
     def _refresh_task_config(self) -> TaskConfig:
@@ -277,6 +284,7 @@ class LLMOrchestrator:
                 user_id="system",
                 request_type=self.request_type,
                 endpoint="/chat/completions",
+                task_name=self.task_name,
                 time_cost=time_cost,
             )
         return self._build_generation_result(
@@ -368,6 +376,7 @@ class LLMOrchestrator:
                 user_id="system",
                 request_type=self.request_type,
                 endpoint="/chat/completions",
+                task_name=self.task_name,
                 time_cost=time.time() - start_time,
             )
         return self._build_generation_result(
@@ -380,7 +389,7 @@ class LLMOrchestrator:
 
     async def generate_response_with_message_async(
         self,
-        message_factory: Callable[[BaseClient], List[Message]],
+        message_factory: Callable[..., List[Message] | Awaitable[List[Message]]],
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         model_name: Optional[str] = None,
@@ -440,6 +449,7 @@ class LLMOrchestrator:
                 user_id="system",
                 request_type=self.request_type,
                 endpoint="/chat/completions",
+                task_name=self.task_name,
                 time_cost=time_cost,
             )
         return self._build_generation_result(
@@ -475,6 +485,7 @@ class LLMOrchestrator:
                 user_id="system",
                 request_type=self.request_type,
                 endpoint="/embeddings",
+                task_name=self.task_name,
                 time_cost=time.time() - start_time,
             )
         if not embedding:
@@ -930,7 +941,7 @@ class LLMOrchestrator:
     async def _execute_request(
         self,
         request_type: RequestType,
-        message_factory: Optional[Callable[[BaseClient], List[Message]]] = None,
+        message_factory: Optional[Callable[..., List[Message] | Awaitable[List[Message]]]] = None,
         tool_options: List[ToolOption] | None = None,
         response_format: RespFormat | None = None,
         stream_response_handler: Optional[Callable[..., Any]] = None,
@@ -973,9 +984,13 @@ class LLMOrchestrator:
             if message_factory:
                 parameter_count = len(inspect.signature(message_factory).parameters)
                 if parameter_count >= 2:
-                    message_list = message_factory(client, model_info)
+                    message_result = message_factory(client, model_info)
                 else:
-                    message_list = message_factory(client)
+                    message_result = message_factory(client)
+                if inspect.isawaitable(message_result):
+                    message_list = await message_result
+                else:
+                    message_list = message_result
             try:
                 request = self._build_client_request(
                     request_type=request_type,
@@ -1073,18 +1088,13 @@ class LLMOrchestrator:
         """
         detail_lines: List[str] = []
         if e.__cause__:
-            detail_lines.append(f"底层异常类型: {type(e.__cause__).__name__}")
-            detail_lines.append(f"底层异常信息: {e.__cause__}")
+            detail_lines.append(f"底层异常: {type(e.__cause__).__name__} | {e.__cause__}")
 
         snapshot_info = format_request_snapshot_log_info(e)
         if detail_lines or snapshot_info:
             detail_text = "\n  " + "\n  ".join(detail_lines) if detail_lines else ""
             return f"{detail_text}{snapshot_info}"
 
-        if e.__cause__:
-            original_error_type = type(e.__cause__).__name__
-            original_error_msg = str(e.__cause__)
-            return f"\n  底层异常类型: {original_error_type}\n  底层异常信息: {original_error_msg}"
         return ""
 
 

@@ -373,6 +373,34 @@ describe('DynamicField', () => {
       expect(onChange).toHaveBeenCalled()
     })
 
+    it('keeps numeric input empty while replacing a value', async () => {
+      const schema: FieldSchema = {
+        name: 'test_number_replace',
+        type: 'integer',
+        label: 'Test Number Replace',
+        description: 'A numeric field being edited',
+        required: false,
+        default: 0,
+      }
+      let controlledValue: unknown = 7
+      const onChange = vi.fn((nextValue: unknown) => {
+        controlledValue = nextValue
+        view.rerender(<DynamicField schema={schema} value={controlledValue} onChange={onChange} />)
+      })
+      const user = userEvent.setup()
+
+      const view = render(<DynamicField schema={schema} value={controlledValue} onChange={onChange} />)
+      const input = screen.getByRole('spinbutton') as HTMLInputElement
+
+      await user.clear(input)
+      expect(input.value).toBe('')
+      expect(onChange).not.toHaveBeenCalled()
+
+      await user.type(input, '8')
+      expect(onChange).toHaveBeenLastCalledWith(8)
+      expect(input.value).toBe('8')
+    })
+
     it('triggers numeric onChange for input widget with integer type', async () => {
       const schema: FieldSchema = {
         name: 'test_integer_input_widget_change',
@@ -499,6 +527,36 @@ describe('DynamicField', () => {
       render(<DynamicField schema={schema} value="2.5" onChange={onChange} />)
 
       expect(screen.getByText('2.5')).toBeInTheDocument()
+    })
+
+    it('allows manual numeric input for slider widgets', async () => {
+      const schema: FieldSchema = {
+        name: 'test_slider_manual_value',
+        type: 'number',
+        label: 'Test Slider Manual Value',
+        description: 'A slider with manual input',
+        required: false,
+        'x-widget': 'slider',
+        minValue: 0,
+        maxValue: 1,
+        step: 0.001,
+        default: 0,
+      }
+      let controlledValue: unknown = 0.5
+      const onChange = vi.fn((nextValue: unknown) => {
+        controlledValue = nextValue
+        view.rerender(<DynamicField schema={schema} value={controlledValue} onChange={onChange} />)
+      })
+      const user = userEvent.setup()
+
+      const view = render(<DynamicField schema={schema} value={controlledValue} onChange={onChange} />)
+      const input = screen.getByRole('spinbutton', { name: 'Test Slider Manual Value 数值' })
+
+      await user.clear(input)
+      await user.type(input, '0.123')
+
+      expect(onChange).toHaveBeenLastCalledWith(0.123)
+      expect(input).toHaveValue(0.123)
     })
   })
 

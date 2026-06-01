@@ -26,6 +26,7 @@ import { ShortcutKbd } from '@/components/ui/kbd'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { ThinkingIllustration } from '@/components/ui/thinking-illustration'
 import {
   Select,
   SelectContent,
@@ -94,10 +95,12 @@ export function ExpressionReviewer({
   const [quickFilterType, setQuickFilterType] = useState<'unchecked' | 'passed' | 'all'>('unchecked')
   const [quickExpressions, setQuickExpressions] = useState<Expression[]>([])
   const quickExpressionsRef = useRef<Expression[]>([])
+  const quickExcludedIdsRef = useRef<Set<number>>(new Set())
   const [quickCurrentIndex, setQuickCurrentIndex] = useState(0)
   const [quickLoading, setQuickLoading] = useState(false)
+  const quickLoadingRef = useRef(false)
   const [quickTotal, setQuickTotal] = useState(0)
-  const [quickPage, setQuickPage] = useState(1)
+  const [quickHasMore, setQuickHasMore] = useState(true)
   const swipeDirectionRef = useRef<'left' | 'right' | null>(null)
   const isAnimatingRef = useRef(false)
   const [cardSpring, cardApi] = useSpring(() => ({ x: 0, opacity: 1, rotate: 0, config: { tension: 300, friction: 30 } }))
@@ -194,30 +197,37 @@ export function ExpressionReviewer({
 
   // 快速审核模式 - 加载数据
   const loadQuickList = useCallback(async (resetIndex = true, append = false) => {
+    if (quickLoadingRef.current) return
+
     try {
+      quickLoadingRef.current = true
       setQuickLoading(true)
-      const pageToLoad = append ? quickPage + 1 : quickPage
+      const excludedIds = append ? Array.from(quickExcludedIdsRef.current) : []
       const result = await getReviewList({
-        page: quickFilterType === 'unchecked' ? 1 : pageToLoad,
+        page: 1,
         page_size: 20,
         filter_type: quickFilterType,
         order: quickFilterType === 'unchecked' ? 'random' : 'latest',
-        exclude_ids: quickFilterType === 'unchecked' && append
-          ? quickExpressionsRef.current.map((expr) => expr.id)
-          : undefined,
+        exclude_ids: excludedIds.length > 0 ? excludedIds : undefined,
       })
-      
+
       if (result.success) {
         if (append) {
-          // 追加模式：拼接数据
-          setQuickExpressions(prev => [...prev, ...result.data.data])
-          setQuickPage(pageToLoad)
+          const loadedCount = quickExpressionsRef.current.length
+          const existingIds = new Set(quickExpressionsRef.current.map(e => e.id))
+          const newItems = result.data.data.filter((e: Expression) => !existingIds.has(e.id))
+          newItems.forEach((expr: Expression) => quickExcludedIdsRef.current.add(expr.id))
+
+          setQuickExpressions(prev => [...prev, ...newItems])
+          setQuickTotal(loadedCount + result.data.total)
+          setQuickHasMore(newItems.length > 0 && result.data.total > newItems.length)
         } else {
-          // 替换模式
+          quickExcludedIdsRef.current = new Set(result.data.data.map((expr: Expression) => expr.id))
           setQuickExpressions(result.data.data)
+          setQuickTotal(result.data.total)
+          setQuickHasMore(result.data.total > result.data.data.length)
         }
-        
-        setQuickTotal(result.data.total)
+
         if (resetIndex) {
           setQuickCurrentIndex(0)
         }
@@ -235,15 +245,18 @@ export function ExpressionReviewer({
         variant: 'destructive',
       })
     } finally {
+      quickLoadingRef.current = false
       setQuickLoading(false)
     }
-  }, [quickPage, quickFilterType, toast])
+  }, [quickFilterType, toast])
 
   // 快速审核模式 - 切换筛选时重置
   useEffect(() => {
     if (reviewMode === 'quick') {
-      setQuickPage(1)
+      quickExcludedIdsRef.current = new Set()
       setQuickCurrentIndex(0)
+      setQuickHasMore(true)
+      setQuickExpressions([])
     }
   }, [quickFilterType, reviewMode])
 
@@ -253,7 +266,7 @@ export function ExpressionReviewer({
       loadQuickList()
       loadStats()
     }
-  }, [open, reviewMode, quickPage, quickFilterType, loadQuickList, loadStats])
+  }, [open, reviewMode, quickFilterType, loadQuickList, loadStats])
 
   // 获取当前卡片允许的滑动方向
   const getAllowedDirections = useCallback((expr: Expression | undefined) => {
@@ -315,28 +328,21 @@ export function ExpressionReviewer({
         
         // 从列表中移除当前项
         setTimeout(() => {
-          setQuickExpressions(prev => prev.filter((_, i) => i !== quickCurrentIndex))
-          setQuickTotal(prev => prev - 1)
-          
-          // 如果当前索引超出范围，调整索引
-          if (quickCurrentIndex >= quickExpressions.length - 1) {
-            setQuickCurrentIndex(Math.max(0, quickCurrentIndex - 1))
-          }
-          
-          // 重置状态
           swipeDirectionRef.current = null
           swipeOffsetRef.current = 0
           cardApi.set({ x: 0, opacity: 1, rotate: 0 })
           isAnimatingRef.current = false
+
+          const stillExists = quickExpressionsRef.current.some(e => e.id === currentExpr.id)
+          if (!stillExists) return
+
+          quickExcludedIdsRef.current.add(currentExpr.id)
+          setQuickExpressions(prev => prev.filter(e => e.id !== currentExpr.id))
+          setQuickTotal(prev => Math.max(0, prev - 1))
           
           // 刷新统计
           loadStats()
           onReviewed?.()
-          
-          // 如果列表为空且还有更多数据，加载下一页
-          if (quickExpressions.length <= 1 && quickTotal > 1) {
-            loadQuickList(false)
-          }
         }, 300)
       } else {
         // 冲突处理
@@ -378,8 +384,6 @@ export function ExpressionReviewer({
     toast,
     loadStats,
     onReviewed,
-    quickTotal,
-    loadQuickList,
   ])
 
   // 拖拽开始
@@ -546,12 +550,21 @@ export function ExpressionReviewer({
     
     // 距离末尾还有5个或更少时，且还有更多数据时，自动加载
     const remaining = quickExpressions.length - quickCurrentIndex - 1
-    const hasMoreData = quickExpressions.length < quickTotal
-    
-    if (remaining <= 5 && hasMoreData) {
+
+    if (remaining <= 5 && quickHasMore) {
       loadQuickList(false, true) // 追加模式
     }
-  }, [open, reviewMode, quickCurrentIndex, quickExpressions.length, quickTotal, quickLoading, loadQuickList])
+  }, [open, reviewMode, quickCurrentIndex, quickExpressions.length, quickHasMore, quickLoading, loadQuickList])
+
+  // 修正删除最后一张卡片后的索引
+  useEffect(() => {
+    if (quickLoading) return
+
+    const maxIndex = Math.max(0, quickExpressions.length - 1)
+    if (quickCurrentIndex > maxIndex) {
+      setQuickCurrentIndex(maxIndex)
+    }
+  }, [quickExpressions.length, quickCurrentIndex, quickLoading])
 
   // 初始加载
   useEffect(() => {
@@ -723,39 +736,40 @@ export function ExpressionReviewer({
     })
   }
 
-  // 获取状态标签
-  const getStatusBadge = (expr: Expression) => {
+  // 获取审核状态标签
+  const getReviewBadge = (expr: Expression) => {
+    const modifier = expr.modified_by?.toLowerCase()
+
     if (!expr.checked) {
+      if (modifier === 'ai') {
+        return (
+          <Badge variant="secondary" className="gap-1 whitespace-nowrap">
+            <Bot className="h-3 w-3" />
+            AI预检通过
+          </Badge>
+        )
+      }
       return (
-        <Badge variant="outline" className="gap-1">
+        <Badge variant="outline" className="gap-1 whitespace-nowrap">
           <Clock className="h-3 w-3" />
           待审核
         </Badge>
       )
     }
-    return (
-      <Badge variant="default" className="gap-1 bg-green-600">
-        <CheckCircle2 className="h-3 w-3" />
-        已通过
-      </Badge>
-    )
-  }
 
-  // 获取修改者标签
-  const getModifierBadge = (modifier: string | null) => {
-    if (!modifier) return null
-    if (modifier === 'ai') {
+    if (modifier === 'user') {
       return (
-        <Badge variant="secondary" className="gap-1 text-xs">
-          <Bot className="h-3 w-3" />
-          AI
+        <Badge variant="default" className="gap-1 whitespace-nowrap bg-green-600">
+          <User className="h-3 w-3" />
+          人工通过
         </Badge>
       )
     }
+
     return (
-      <Badge variant="secondary" className="gap-1 text-xs">
-        <User className="h-3 w-3" />
-        人工
+      <Badge variant="default" className="gap-1 whitespace-nowrap bg-green-600">
+        <CheckCircle2 className="h-3 w-3" />
+        已通过
       </Badge>
     )
   }
@@ -1138,8 +1152,7 @@ export function ExpressionReviewer({
                         <span>·</span>
                         <span>{formatTime(expr.create_date)}</span>
                         <div className="flex items-center gap-1">
-                          {getStatusBadge(expr)}
-                          {getModifierBadge(expr.modified_by)}
+                          {getReviewBadge(expr)}
                         </div>
                       </div>
                     </div>
@@ -1385,11 +1398,10 @@ export function ExpressionReviewer({
             </div>
 
             {/* 卡片区域 */}
-            <div className="flex-1 flex flex-col items-center justify-center p-4 sm:p-8 relative overflow-hidden">
+            <div className="flex-1 min-h-0 flex flex-col items-center justify-center gap-3 p-3 sm:p-4 relative overflow-hidden">
               {quickLoading && quickExpressions.length === 0 ? (
                 <div className="flex flex-col items-center justify-center">
-                  <RefreshCw className="h-8 w-8 animate-spin text-muted-foreground mb-4" />
-                  <p className="text-muted-foreground">Thinking...</p>
+                  <ThinkingIllustration size="lg" />
                 </div>
               ) : quickExpressions.length === 0 ? (
                 <div className="flex flex-col items-center justify-center text-center">
@@ -1402,11 +1414,8 @@ export function ExpressionReviewer({
               ) : (
                 <>
                   {/* 进度提示 */}
-                  <div className="absolute top-4 left-1/2 -translate-x-1/2 text-sm text-muted-foreground z-50">
-                    {quickCurrentIndex + 1} / {quickExpressions.length}
-                    {quickTotal > quickExpressions.length && (
-                      <span className="ml-1">（共 {quickTotal} 条）</span>
-                    )}
+                  <div className="shrink-0 text-sm text-muted-foreground font-medium">
+                    {Math.min(quickCurrentIndex + 1, Math.max(quickTotal, quickExpressions.length))} / {Math.max(quickTotal, quickExpressions.length)}
                   </div>
 
                   {/* 方向提示 (仅针对当前卡片) */}
@@ -1439,7 +1448,7 @@ export function ExpressionReviewer({
 
                   {/* 堆叠卡片 */}
                   <div
-                    className="relative w-full max-w-md h-[400px] flex items-center justify-center"
+                    className="relative w-full max-w-md flex-1 min-h-[320px] max-h-[560px] flex items-center justify-center"
                     role="listbox"
                     tabIndex={0}
                     aria-label="待审核的表达方式"
@@ -1460,7 +1469,7 @@ export function ExpressionReviewer({
                           transition: isCurrent && !isDraggingRef.current ? 'all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1)' : 'none',
                         }
 
-if (isCurrent) {
+                        if (isCurrent) {
                           // 当前卡片：样式由 useSpring 控制，通过 animated.div 渲染
                           // style 仅保留非动画属性
                           style = {
@@ -1499,7 +1508,7 @@ if (isCurrent) {
                             ...style,
                             transform: `translate3d(${currentTranslateX}px, ${currentTranslateY}px, 0) scale(${currentScale}) rotate(${currentRotate}deg)`,
                             opacity: 1 - index * 0.15,
-                            filter: `blur(${Math.max(0, index * 1 - progress)}px)`, // 模糊度也随之减小
+                            filter: `blur(${Math.max(0, index * 1.5 - progress)}px)`, // 模糊度也随之减小
                             pointerEvents: 'none',
                           }
                         }
@@ -1512,7 +1521,7 @@ if (isCurrent) {
                             id={`quick-expr-${expr.id}`}
                             aria-selected={true}
                             className={cn(
-                              'bg-card border rounded-xl shadow-xl p-6 select-none h-full flex flex-col',
+                              'bg-card border rounded-xl shadow-xl p-5 sm:p-6 select-none h-full min-h-0 overflow-hidden flex flex-col',
                               'active:cursor-grabbing shadow-2xl ring-1 ring-border/50',
                               // 冲突动效
                               conflictId === expr.id && 'ring-4 ring-orange-500/50 bg-orange-50/10'
@@ -1549,26 +1558,25 @@ if (isCurrent) {
                               </div>
                             </div>
                             {/* 内容区 */}
-                            <div className="space-y-4 flex-1">
+                            <div className="space-y-3 flex-1 min-h-0 overflow-hidden">
                               {/* 状态和ID */}
                               <div className="flex items-center justify-between">
                                 <span className="text-sm text-muted-foreground font-mono">#{expr.id}</span>
                                 <div className="flex items-center gap-2">
-                                  {getStatusBadge(expr)}
-                                  {getModifierBadge(expr.modified_by)}
+                                  {getReviewBadge(expr)}
                                 </div>
                               </div>
                               {/* 情景 */}
                               <div className="space-y-1.5">
                                 <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">情景</div>
                                 <div className="p-3 bg-muted/30 rounded-lg border border-border/50">
-                                  <p className="text-lg font-medium leading-relaxed">{expr.situation}</p>
+                                  <p className="text-base sm:text-lg font-medium leading-relaxed break-words line-clamp-3">{expr.situation}</p>
                                 </div>
                               </div>
                               {/* 风格 */}
-                              <div className="space-y-1.5">
+                              <div className="space-y-1.5 min-h-0">
                                 <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">风格</div>
-                                <div className="flex flex-wrap gap-2">
+                                <div className="flex max-h-24 flex-wrap gap-2 overflow-y-auto pr-1">
                                   {expr.style.split(/[,，]/).map((s, i) => (
                                     <Badge key={i} variant="secondary" className="font-normal">
                                       {s.trim()}
@@ -1578,16 +1586,16 @@ if (isCurrent) {
                               </div>
                             </div>
                             {/* 底部信息 */}
-                            <div className="mt-auto pt-4 border-t flex items-center justify-between text-xs text-muted-foreground">
-                              <div className="flex items-center gap-2">
+                            <div className="mt-3 shrink-0 pt-3 border-t flex items-center justify-between gap-3 text-xs text-muted-foreground">
+                              <div className="flex min-w-0 items-center gap-2">
                                 <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center text-primary">
                                   <User className="h-3 w-3" />
                                 </div>
-                                <span title={getChatName(expr)} className="truncate max-w-[120px] font-medium">
+                                <span title={getChatName(expr)} className="truncate font-medium">
                                   {getChatName(expr)}
                                 </span>
                               </div>
-                              <span className="font-mono">{formatTime(expr.create_date)}</span>
+                              <span className="shrink-0 font-mono">{formatTime(expr.create_date)}</span>
                             </div>
                           </AnimatedDiv>
                         ) : (
@@ -1597,31 +1605,30 @@ if (isCurrent) {
                             id={`quick-expr-${expr.id}`}
                             aria-selected={false}
                             className={cn(
-                              'bg-card border rounded-xl shadow-xl p-6 select-none h-full flex flex-col'
+                              'bg-card border rounded-xl shadow-xl p-5 sm:p-6 select-none h-full min-h-0 overflow-hidden flex flex-col'
                             )}
                             style={style}
                           >
                             {/* 内容区 */}
-                            <div className="space-y-4 flex-1">
+                            <div className="space-y-3 flex-1 min-h-0 overflow-hidden">
                               {/* 状态和ID */}
                               <div className="flex items-center justify-between">
                                 <span className="text-sm text-muted-foreground font-mono">#{expr.id}</span>
                                 <div className="flex items-center gap-2">
-                                  {getStatusBadge(expr)}
-                                  {getModifierBadge(expr.modified_by)}
+                                  {getReviewBadge(expr)}
                                 </div>
                               </div>
                               {/* 情景 */}
                               <div className="space-y-1.5">
                                 <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">情景</div>
                                 <div className="p-3 bg-muted/30 rounded-lg border border-border/50">
-                                  <p className="text-lg font-medium leading-relaxed">{expr.situation}</p>
+                                  <p className="text-base sm:text-lg font-medium leading-relaxed break-words line-clamp-3">{expr.situation}</p>
                                 </div>
                               </div>
                               {/* 风格 */}
-                              <div className="space-y-1.5">
+                              <div className="space-y-1.5 min-h-0">
                                 <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">风格</div>
-                                <div className="flex flex-wrap gap-2">
+                                <div className="flex max-h-24 flex-wrap gap-2 overflow-y-auto pr-1">
                                   {expr.style.split(/[,，]/).map((s, i) => (
                                     <Badge key={i} variant="secondary" className="font-normal">
                                       {s.trim()}
@@ -1631,16 +1638,16 @@ if (isCurrent) {
                               </div>
                             </div>
                             {/* 底部信息 */}
-                            <div className="mt-auto pt-4 border-t flex items-center justify-between text-xs text-muted-foreground">
-                              <div className="flex items-center gap-2">
+                            <div className="mt-3 shrink-0 pt-3 border-t flex items-center justify-between gap-3 text-xs text-muted-foreground">
+                              <div className="flex min-w-0 items-center gap-2">
                                 <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center text-primary">
                                   <User className="h-3 w-3" />
                                 </div>
-                                <span title={getChatName(expr)} className="truncate max-w-[120px] font-medium">
+                                <span title={getChatName(expr)} className="truncate font-medium">
                                   {getChatName(expr)}
                                 </span>
                               </div>
-                              <span className="font-mono">{formatTime(expr.create_date)}</span>
+                              <span className="shrink-0 font-mono">{formatTime(expr.create_date)}</span>
                             </div>
                           </div>
                         )
@@ -1648,7 +1655,7 @@ if (isCurrent) {
                   </div>
 
                   {/* 操作按钮（移动端） */}
-                  <div className="flex items-center gap-8 mt-8 sm:hidden z-50">
+                  <div className="flex shrink-0 items-center gap-8 sm:hidden z-50">
                     {(() => {
                       const currentExpr = quickExpressions[quickCurrentIndex]
                       const directions = getAllowedDirections(currentExpr)
@@ -1687,7 +1694,7 @@ if (isCurrent) {
             </div>
 
             {/* 底部快捷键提示（桌面端） */}
-            <div className="hidden sm:flex items-center justify-center gap-6 px-6 py-3 border-t text-xs text-muted-foreground">
+            <div className="hidden sm:flex shrink-0 flex-wrap items-center justify-center gap-x-5 gap-y-2 px-4 py-2 border-t text-xs text-muted-foreground">
               <div className="flex items-center gap-1">
                 <ShortcutKbd size="sm" keys={['left']} />
                 <span>拒绝</span>

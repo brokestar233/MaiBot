@@ -28,8 +28,11 @@ export function Layout({ children }: LayoutProps) {
   const router = useRouter()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const announce = useAnnounce()
-  const workspaceMode = pathname.startsWith('/chat') ? 'chat' : 'settings'
+  const isLogsPath = pathname === '/logs' || pathname.startsWith('/reasoning-process')
+  const workspaceMode = pathname.startsWith('/chat') ? 'chat' : isLogsPath ? 'logs' : 'settings'
+  const isSettingsWorkspace = workspaceMode === 'settings'
   const isChatWorkspace = workspaceMode === 'chat'
+  const showBackToTop = isSettingsWorkspace
 
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
@@ -73,6 +76,8 @@ export function Layout({ children }: LayoutProps) {
       }
     }
     pathToLabel['/chat'] = t('workspace.chat')
+    pathToLabel['/logs'] = t('workspace.logs')
+    pathToLabel['/reasoning-process'] = t('sidebar.menu.reasoningProcess')
 
     return router.subscribe('onResolved', () => {
       const pageTitle = pathToLabel[router.state.location.pathname] ?? 'MaiBot Dashboard'
@@ -120,12 +125,15 @@ export function Layout({ children }: LayoutProps) {
     <TooltipProvider delayDuration={300}>
       <SkipNav />
       {isElectron() && <TitleBar />}
-      <div className={cn('relative isolate flex h-screen overflow-hidden', isElectron() && 'pt-8')}>
+      <div
+        data-dashboard-shell="true"
+        className={cn('relative isolate flex h-screen overflow-hidden overscroll-none', isElectron() && 'pt-8')}
+      >
         <BackgroundLayer config={pageBg} layerId="page" />
-        <div className="relative z-10 flex h-full w-full overflow-hidden">
+        <div className="relative z-10 flex h-full min-h-0 w-full overflow-hidden">
           {/* Sidebar：仅在设置工作区显示，伴随滑入/滑出动画 */}
           <AnimatePresence initial={false}>
-            {!isChatWorkspace && (
+            {isSettingsWorkspace && (
               <motion.div
                 key="settings-sidebar"
                 className="relative z-40 hidden shrink-0 lg:block"
@@ -152,7 +160,7 @@ export function Layout({ children }: LayoutProps) {
           </AnimatePresence>
 
           {/* 移动端 Sidebar 走自己的 fixed 定位，通过 mobileMenuOpen 控制显隐 */}
-          {!isChatWorkspace && (
+          {isSettingsWorkspace && (
             <div className="lg:hidden">
               <Sidebar
                 sidebarOpen={sidebarOpen}
@@ -165,7 +173,7 @@ export function Layout({ children }: LayoutProps) {
 
           {/* Mobile overlay */}
           <AnimatePresence>
-            {!isChatWorkspace && mobileMenuOpen && (
+            {isSettingsWorkspace && mobileMenuOpen && (
               <motion.div
                 aria-hidden="true"
                 className="fixed inset-0 z-40 bg-black/50 lg:hidden"
@@ -178,7 +186,7 @@ export function Layout({ children }: LayoutProps) {
             )}
           </AnimatePresence>
           {/* Main content */}
-          <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             {/* HTTP 安全警告横幅 */}
             <HttpWarningBanner />
 
@@ -198,9 +206,11 @@ export function Layout({ children }: LayoutProps) {
             {/* Page content */}
             <main
               id="main-content"
+              data-dashboard-main="true"
               tabIndex={-1}
               className={cn(
-                'relative isolate flex-1 overflow-hidden outline-none',
+                'relative isolate min-h-0 flex-1 outline-none',
+                isSettingsWorkspace ? 'overflow-y-auto overflow-x-hidden overscroll-contain' : 'overflow-hidden',
                 isChatWorkspace
                   ? 'bg-transparent'
                   : pageBg.type === 'none'
@@ -211,7 +221,7 @@ export function Layout({ children }: LayoutProps) {
               <AnimatePresence mode="wait" initial={false}>
                 <motion.div
                   key={workspaceMode}
-                  className="relative z-10 h-full min-w-0"
+                  className={cn('relative z-10 min-w-0', isSettingsWorkspace ? 'h-full min-h-full' : 'h-full')}
                   initial={{ opacity: 0, x: isChatWorkspace ? 32 : -32, filter: 'blur(6px)' }}
                   animate={{ opacity: 1, x: 0, filter: 'blur(0px)' }}
                   exit={{ opacity: 0, x: isChatWorkspace ? -32 : 32, filter: 'blur(6px)' }}
@@ -230,7 +240,7 @@ export function Layout({ children }: LayoutProps) {
             </main>
 
             {/* Back to Top Button */}
-            {!isChatWorkspace && <BackToTop />}
+            {showBackToTop && <BackToTop />}
           </div>
         </div>
       </div>

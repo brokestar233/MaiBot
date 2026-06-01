@@ -11,6 +11,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useToast } from '@/hooks/use-toast'
+import { fetchModelClientTypes, type ModelClientType } from '@/lib/config-api'
 
 import { PROVIDER_TEMPLATES } from '../providerTemplates'
 import type { APIProvider, FormErrors } from './types'
@@ -40,7 +41,29 @@ export function ProviderForm({
   const [templateComboboxOpen, setTemplateComboboxOpen] = useState(false)
   const [showApiKey, setShowApiKey] = useState(false)
   const [localProvider, setLocalProvider] = useState<APIProvider | null>(editingProvider)
+  const [clientTypes, setClientTypes] = useState<ModelClientType[]>([])
   const { toast } = useToast()
+
+  useEffect(() => {
+    if (!open) return
+
+    let cancelled = false
+    fetchModelClientTypes()
+      .then((result) => {
+        if (!cancelled && result.success) {
+          setClientTypes(result.data || [])
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setClientTypes([])
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [open])
 
   // 当弹窗打开时，根据当前编辑对象同步一次本地编辑状态
   useEffect(() => {
@@ -68,6 +91,25 @@ export function ProviderForm({
   }, [open, editingProvider, editingIndex])
 
   const isUsingTemplate = useMemo(() => selectedTemplate !== 'custom', [selectedTemplate])
+  const clientTypeOptions = useMemo(() => {
+    const options = [...clientTypes]
+    const knownTypes = new Set(options.map((item) => item.client_type))
+
+    for (const clientType of ['openai', 'gemini', 'anthropic', localProvider?.client_type].filter(Boolean) as string[]) {
+      if (!knownTypes.has(clientType)) {
+        options.push({
+          client_type: clientType,
+          owner_plugin_id: null,
+          version: '',
+          description: '',
+          builtin: clientType === 'openai' || clientType === 'gemini',
+        })
+        knownTypes.add(clientType)
+      }
+    }
+
+    return options
+  }, [clientTypes, localProvider?.client_type])
 
   const handleTemplateChange = useCallback((templateId: string) => {
     setSelectedTemplate(templateId)
@@ -358,6 +400,7 @@ export function ProviderForm({
                         <li><strong>Gemini：</strong>Google Gemini 专用格式</li>
                         <li><strong>Anthropic：</strong>Claude Messages API 原生格式</li>
                         <li>大部分第三方提供商都兼容 OpenAI 格式</li>
+                        <li>已加载的插件可以在这里提供新的客户端类型</li>
                       </ul>
                     </div>
                   }
@@ -378,9 +421,12 @@ export function ProviderForm({
                   <SelectValue placeholder="选择客户端类型" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="openai">OpenAI</SelectItem>
-                  <SelectItem value="gemini">Gemini</SelectItem>
-                  <SelectItem value="anthropic">Anthropic</SelectItem>
+                  {clientTypeOptions.map((item) => (
+                    <SelectItem key={item.client_type} value={item.client_type}>
+                      {item.client_type}
+                      {item.owner_plugin_id ? ` (${item.owner_plugin_id})` : ''}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
               {isUsingTemplate && (

@@ -18,7 +18,7 @@ from src.cli.console import console
 from src.chat.heart_flow.heartFC_utils import CycleDetail
 from src.chat.message_receive.chat_manager import BotChatSession, chat_manager
 from src.chat.message_receive.message import SessionMessage
-from src.chat.utils.utils import is_mentioned_bot_in_message
+from src.chat.utils.utils import get_bot_account, is_bot_self, is_mentioned_bot_in_message
 from src.common.data_models.mai_message_data_model import GroupInfo, MessageInfo, UserInfo
 from src.common.data_models.message_component_data_model import (
     ForwardNodeComponent,
@@ -27,6 +27,7 @@ from src.common.data_models.message_component_data_model import (
     TextComponent,
 )
 from src.common.logger import get_logger
+from src.common.message_repository import find_messages
 from src.common.utils.utils_config import ChatConfigUtils, ExpressionConfigUtils, JargonConfigUtils
 from src.config.config import global_config
 from src.core.tooling import ToolRegistry, ToolSpec
@@ -65,6 +66,8 @@ logger = get_logger("maisaka_runtime")
 
 MAX_INTERNAL_ROUNDS = 10
 MAX_RETAINED_MESSAGE_CACHE_SIZE = 200
+CONTEXT_RESTORE_FILL_RATIO = 0.5
+EXTERNAL_MESSAGE_INTERVAL_SAMPLE_WINDOW_SECONDS = 1800.0
 
 
 class MaisakaHeartFlowChatting:
@@ -107,11 +110,10 @@ class MaisakaHeartFlowChatting:
         self._deferred_message_turn_task: Optional[asyncio.Task[None]] = None
         self._message_debounce_seconds = 1.0
         self._message_debounce_required = False
-        self._oldest_pending_message_received_at: Optional[float] = None
         self._last_message_received_at = 0.0
+        self._last_external_message_received_at: Optional[float] = None
         self._talk_frequency_adjust = 1.0
-        self._reply_latency_measurement_started_at: Optional[float] = None
-        self._recent_reply_latencies: deque[tuple[float, float]] = deque()
+        self._recent_external_message_intervals: deque[tuple[float, float]] = deque()
         self._wait_timeout_task: Optional[asyncio.Task[None]] = None
         self._max_internal_rounds = MAX_INTERNAL_ROUNDS
         self._agent_state: Literal["running", "wait", "stop"] = self._STATE_STOP
@@ -224,11 +226,73 @@ class MaisakaHeartFlowChatting:
         if global_config.mcp.enable:
             await self._init_mcp()
 
+        await self._restore_recent_context_from_db()
         self._running = True
         self._ensure_background_tasks_running()
         self._schedule_message_turn()
         self._update_stage_status("空闲", "等待消息触发")
         logger.info(f"{self.log_prefix} Maisaka 运行时已启动")
+
+    async def _restore_recent_context_from_db(self) -> None:
+        """启动时从消息库恢复最近上下文，避免重启后丢失短期对话窗口。"""
+
+        if self._chat_history or self.message_cache:
+            return
+
+        try:
+            recent_messages = await asyncio.to_thread(
+                find_messages,
+                session_id=self.session_id,
+                limit=self._get_context_restore_limit(),
+                limit_mode="latest",
+                filter_command=True,
+            )
+        except Exception as exc:
+            logger.warning(f"{self.log_prefix} 恢复最近上下文失败: {exc}", exc_info=True)
+            return
+
+        restored_user_messages: list[SessionMessage] = []
+        restored_history: list[LLMContextMessage] = []
+        for message in recent_messages:
+            if message.is_notify:
+                continue
+
+            source_kind = self._resolve_restored_message_source_kind(message)
+            history_message = await self._reasoning_engine._build_history_message(
+                message,
+                source_kind=source_kind,
+            )
+            if history_message is not None:
+                restored_history.append(history_message)
+
+            if source_kind == "user":
+                restored_user_messages.append(message)
+
+        if not restored_history:
+            return
+
+        self._chat_history.extend(restored_history)
+        self.message_cache = restored_user_messages[-MAX_RETAINED_MESSAGE_CACHE_SIZE:]
+        self._last_processed_index = len(self.message_cache)
+        logger.info(
+            f"{self.log_prefix} 已恢复最近上下文: "
+            f"历史消息={len(restored_history)} 用户消息缓存={len(self.message_cache)}"
+        )
+
+    def _get_context_restore_limit(self) -> int:
+        """返回启动时最多回灌的真实消息数量。"""
+
+        return max(1, ceil(self._max_context_size * CONTEXT_RESTORE_FILL_RATIO))
+
+    @staticmethod
+    def _resolve_restored_message_source_kind(message: SessionMessage) -> str:
+        """根据发送者身份区分恢复消息来自用户还是麦麦自己。"""
+
+        user_info = message.message_info.user_info
+        bot_account = get_bot_account(message.platform)
+        if bot_account and user_info.user_id == bot_account:
+            return "guided_reply"
+        return "user"
 
     async def stop(self) -> None:
         """停止运行时主循环。"""
@@ -263,7 +327,7 @@ class MaisakaHeartFlowChatting:
 
     def adjust_talk_frequency(self, frequency: float) -> None:
         """调整当前会话的回复频率倍率。"""
-        self._talk_frequency_adjust = max(0.01, float(frequency))
+        self._talk_frequency_adjust = max(0.0, float(frequency))
         self._schedule_message_turn()
 
     def append_sent_message_to_chat_history(
@@ -464,8 +528,7 @@ class MaisakaHeartFlowChatting:
             self._ensure_background_tasks_running()
         received_at = time.time()
         self._last_message_received_at = received_at
-        if self._oldest_pending_message_received_at is None:
-            self._oldest_pending_message_received_at = received_at
+        self._record_external_message_interval(message, received_at)
         self._update_message_trigger_state(message)
         self.message_cache.append(message)
         self._prune_processed_message_cache()
@@ -505,16 +568,35 @@ class MaisakaHeartFlowChatting:
 
     def _get_effective_reply_frequency(self) -> float:
         """返回当前会话生效的回复频率。"""
-        talk_value = max(
-            0.01,
-            float(
-                ChatConfigUtils.get_talk_value(
-                    self.session_id,
-                    is_group_chat=self.chat_stream.is_group_session,
-                )
-            ),
+        base_talk_value = self._get_base_reply_frequency()
+        if base_talk_value <= 0 or self._talk_frequency_adjust <= 0:
+            return 0.0
+
+        talk_value = float(
+            ChatConfigUtils.get_talk_value(
+                self.session_id,
+                is_group_chat=self.chat_stream.is_group_session,
+            )
         )
-        return max(0.01, talk_value * self._talk_frequency_adjust)
+        if talk_value <= 0:
+            return 0.0
+        return max(0.0, talk_value * self._talk_frequency_adjust)
+
+    @staticmethod
+    def _format_reply_frequency_for_display(frequency: float) -> str:
+        """将回复频率格式化为日志中易读的数值。"""
+        normalized_frequency = max(0.0, float(frequency))
+        return f"{normalized_frequency:.3f}（{normalized_frequency * 100:.1f}%）"
+
+    def _get_base_reply_frequency(self) -> float:
+        """返回当前会话类型对应的基础回复频率。"""
+        if self.chat_stream.is_group_session:
+            return float(global_config.chat.talk_value)
+        return float(global_config.chat.private_talk_value)
+
+    def _is_reply_frequency_silent(self) -> bool:
+        """判断当前会话是否处于回复频率为 0 的静默接收模式。"""
+        return self._get_effective_reply_frequency() <= 0.0
 
     async def track_reply_effect(
         self,
@@ -598,6 +680,8 @@ class MaisakaHeartFlowChatting:
     def _get_message_trigger_threshold(self) -> int:
         """根据回复频率折算出触发一轮循环所需的消息数。"""
         effective_frequency = min(1.0, self._get_effective_reply_frequency())
+        if effective_frequency <= 0:
+            return 0
         return max(1, int(ceil(1.0 / effective_frequency)))
 
     def _get_pending_message_count(self) -> int:
@@ -611,34 +695,46 @@ class MaisakaHeartFlowChatting:
             seen_message_ids.add(message.message_id)
         return len(seen_message_ids)
 
-    def _prune_recent_reply_latencies(self, now: Optional[float] = None) -> None:
-        """仅保留最近 10 分钟内的回复时长记录。"""
+    def _prune_recent_external_message_intervals(self, now: Optional[float] = None) -> None:
+        """仅保留最近 30 分钟内的外部消息间隔记录。"""
         current_time = time.time() if now is None else now
-        expire_before = current_time - 600.0
-        while self._recent_reply_latencies and self._recent_reply_latencies[0][0] < expire_before:
-            self._recent_reply_latencies.popleft()
+        expire_before = current_time - EXTERNAL_MESSAGE_INTERVAL_SAMPLE_WINDOW_SECONDS
+        while (
+            self._recent_external_message_intervals
+            and self._recent_external_message_intervals[0][0] < expire_before
+        ):
+            self._recent_external_message_intervals.popleft()
 
-    def _get_recent_average_reply_latency(self) -> Optional[float]:
-        """获取最近 10 分钟平均消息回复时长。"""
-        self._prune_recent_reply_latencies()
-        if not self._recent_reply_latencies:
+    def _get_recent_average_external_message_interval(self) -> Optional[float]:
+        """获取最近 30 分钟外部消息的平均接收间隔。"""
+        self._prune_recent_external_message_intervals()
+        if not self._recent_external_message_intervals:
             return None
 
-        total_duration = sum(duration for _, duration in self._recent_reply_latencies)
-        return total_duration / len(self._recent_reply_latencies)
+        total_interval = sum(interval for _, interval in self._recent_external_message_intervals)
+        return total_interval / len(self._recent_external_message_intervals)
 
-    def _record_reply_sent(self) -> None:
-        """在成功发送 reply 后记录本轮消息回复时长。"""
-        if self._reply_latency_measurement_started_at is None:
+    def _record_external_message_interval(self, message: SessionMessage, received_at: float) -> None:
+        """记录最近外部消息之间的接收间隔，用于低频触发补偿。"""
+
+        user_info = message.message_info.user_info
+        if is_bot_self(message.platform, user_info.user_id):
             return
 
-        reply_duration = max(0.0, time.time() - self._reply_latency_measurement_started_at)
-        self._reply_latency_measurement_started_at = None
-        self._recent_reply_latencies.append((time.time(), reply_duration))
-        self._prune_recent_reply_latencies()
+        previous_received_at = self._last_external_message_received_at
+        self._last_external_message_received_at = received_at
+        if previous_received_at is None:
+            return
+
+        message_interval = max(0.0, received_at - previous_received_at)
+        if message_interval <= 0:
+            return
+
+        self._recent_external_message_intervals.append((received_at, message_interval))
+        self._prune_recent_external_message_intervals(received_at)
         logger.debug(
-            f"{self.log_prefix} 已记录消息回复时长: {reply_duration:.2f} 秒 "
-            f"最近10分钟样本数={len(self._recent_reply_latencies)}"
+            f"{self.log_prefix} 已记录外部消息接收间隔: {message_interval:.2f} 秒 "
+            f"最近30分钟样本数={len(self._recent_external_message_intervals)}"
         )
 
     def find_source_message_by_id(self, message_id: str) -> Optional[SessionMessage]:
@@ -657,6 +753,18 @@ class MaisakaHeartFlowChatting:
             return original_message
 
         return None
+
+    def _has_chat_history_message(self, message_id: str) -> bool:
+        """判断指定真实消息是否已经注入过 Maisaka 上下文。"""
+
+        normalized_message_id = str(message_id or "").strip()
+        if not normalized_message_id:
+            return False
+
+        return any(
+            str(getattr(history_message, "message_id", "") or "").strip() == normalized_message_id
+            for history_message in self._chat_history
+        )
 
     def _prune_processed_message_cache(self) -> None:
         """裁剪 runtime 已经消费过的旧消息。"""
@@ -685,12 +793,13 @@ class MaisakaHeartFlowChatting:
         trigger_threshold: int,
     ) -> bool:
         """在新消息不足阈值时，按空窗时间折算补齐触发条件。"""
-        average_reply_latency = self._get_recent_average_reply_latency()
-        if average_reply_latency is None or average_reply_latency <= 0:
+        average_message_interval = self._get_recent_average_external_message_interval()
+        if average_message_interval is None or average_message_interval <= 0:
             return False
 
-        idle_seconds = max(0.0, time.time() - self._last_message_received_at)
-        equivalent_message_count = pending_count + idle_seconds / average_reply_latency
+        last_external_received_at = self._last_external_message_received_at or self._last_message_received_at
+        idle_seconds = max(0.0, time.time() - last_external_received_at)
+        equivalent_message_count = pending_count + idle_seconds / average_message_interval
         return equivalent_message_count >= trigger_threshold
 
     def _cancel_deferred_message_turn_task(self) -> None:
@@ -790,6 +899,12 @@ class MaisakaHeartFlowChatting:
         self._force_next_timing_message_id = ""
         self._force_next_timing_reason = ""
         return reason
+
+    def _clear_force_next_timing_continue_state(self) -> None:
+        """清理一次性 Timing Gate continue 状态，不触发门控提示。"""
+        self._force_next_timing_continue = False
+        self._force_next_timing_message_id = ""
+        self._force_next_timing_reason = ""
 
     def _has_forced_timing_trigger(self) -> bool:
         """判断是否已有 @/提及必回触发，需绕过普通频率阈值。"""
@@ -1159,13 +1274,21 @@ class MaisakaHeartFlowChatting:
     def _schedule_message_turn(self) -> None:
         """为当前待处理消息安排一次内部 turn。"""
         if self._agent_state == self._STATE_WAIT:
-            return
+            if not self._is_reply_frequency_silent():
+                return
+            self._enter_stop_state()
 
         if not self._has_pending_messages() or self._message_turn_scheduled:
             return
 
         pending_count = self._get_pending_message_count()
         if pending_count <= 0:
+            return
+
+        if self._is_reply_frequency_silent():
+            self._cancel_deferred_message_turn_task()
+            self._message_turn_scheduled = True
+            self._internal_turn_queue.put_nowait("message")
             return
 
         if self._has_forced_timing_trigger():
@@ -1184,12 +1307,13 @@ class MaisakaHeartFlowChatting:
             self._internal_turn_queue.put_nowait("message")
             return
 
-        average_reply_latency = self._get_recent_average_reply_latency()
-        if average_reply_latency is None or average_reply_latency <= 0:
+        average_message_interval = self._get_recent_average_external_message_interval()
+        if average_message_interval is None or average_message_interval <= 0:
             return
 
-        idle_seconds = max(0.0, time.time() - self._last_message_received_at)
-        delay_seconds = max(0.0, (trigger_threshold - pending_count) * average_reply_latency - idle_seconds)
+        last_external_received_at = self._last_external_message_received_at or self._last_message_received_at
+        idle_seconds = max(0.0, time.time() - last_external_received_at)
+        delay_seconds = max(0.0, (trigger_threshold - pending_count) * average_message_interval - idle_seconds)
         self._cancel_deferred_message_turn_task()
         self._deferred_message_turn_task = asyncio.create_task(
             self._schedule_deferred_message_turn(delay_seconds)
@@ -1216,11 +1340,6 @@ class MaisakaHeartFlowChatting:
             # f"{self.log_prefix} 已从消息缓存区[{start_index}:{self._last_processed_index}] "
             # f"收集 {len(unique_messages)} 条新消息"
         # )
-        if unique_messages and self._reply_latency_measurement_started_at is None:
-            self._reply_latency_measurement_started_at = (
-                self._oldest_pending_message_received_at or self._last_message_received_at
-            )
-        self._oldest_pending_message_received_at = None
         return unique_messages
 
     async def _wait_for_message_quiet_period(self) -> None:
@@ -1447,6 +1566,7 @@ class MaisakaHeartFlowChatting:
         body_lines = [
             f"聊天流名称：{getattr(self, 'session_name', self.session_id)}",
             f"聊天流ID：{self.session_id}",
+            f"当前回复频率：{self._format_reply_frequency_for_display(self._get_effective_reply_frequency())}",
         ]
 
         panel_title = "MaiSaka 循环"
@@ -1732,6 +1852,7 @@ class MaisakaHeartFlowChatting:
         tool_call_id: str,
         border_style: str = "bright_yellow",
         output_content: str = "",
+        metadata: Optional[dict[str, Any]] = None,
     ) -> Panel:
         """将工具 prompt 渲染为可点击查看的预览入口。"""
 
@@ -1754,6 +1875,7 @@ class MaisakaHeartFlowChatting:
                         request_kind=labels["request_kind"],
                         selection_reason=subtitle,
                         output_content=output_content,
+                        metadata=metadata,
                     ),
                     title=labels["prompt_title"],
                     border_style=border_style,
@@ -1768,11 +1890,32 @@ class MaisakaHeartFlowChatting:
                 request_kind=labels["request_kind"],
                 subtitle=subtitle,
                 output_content=output_content,
+                metadata=metadata,
             ),
             title=labels["prompt_title"],
             border_style=border_style,
             padding=(0, 1),
         )
+
+    @staticmethod
+    def _build_prompt_preview_metadata_from_tool_metrics(metrics: Any) -> dict[str, Any]:
+        """从工具监控 metrics 中提取可写入 Prompt 预览的模型与耗时。"""
+
+        if not isinstance(metrics, dict):
+            return {}
+
+        metadata: dict[str, Any] = {}
+        model_name = str(metrics.get("model_name") or "").strip()
+        if model_name:
+            metadata["model_name"] = model_name
+
+        for duration_key in ("llm_ms", "overall_ms"):
+            duration_ms = metrics.get(duration_key)
+            if isinstance(duration_ms, (int, float)):
+                metadata["duration_ms"] = duration_ms
+                break
+
+        return metadata
 
     def _normalize_tool_card_body_lines(self, body: Any) -> list[str]:
         """将工具卡片正文规范化为行列表。"""
@@ -1862,6 +2005,7 @@ class MaisakaHeartFlowChatting:
             )
 
         metrics = detail.get("metrics")
+        preview_metadata = self._build_prompt_preview_metadata_from_tool_metrics(metrics)
         if isinstance(metrics, dict):
             metrics_text = self._build_tool_metrics_text(metrics)
             if metrics_text:
@@ -1881,10 +2025,13 @@ class MaisakaHeartFlowChatting:
                 self._build_tool_prompt_access_panel(
                     tool_name=tool_name,
                     prompt_text=prompt_text,
-                    request_messages=detail.get("request_messages") if isinstance(detail.get("request_messages"), list) else None,
+                    request_messages=(
+                        detail.get("request_messages") if isinstance(detail.get("request_messages"), list) else None
+                    ),
                     tool_call_id=tool_call_id,
                     border_style=prompt_border_style,
                     output_content=output_text,
+                    metadata=preview_metadata,
                 )
             )
 

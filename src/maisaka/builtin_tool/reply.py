@@ -189,7 +189,7 @@ async def handle_tool(
             metadata=reply_metadata,
         )
 
-    reply_sequences = tool_ctx.post_process_reply_message_sequences(reply_text)
+    reply_sequences = await tool_ctx.post_process_reply_message_sequences_async(reply_text)
     reply_segments = [build_visible_text_from_sequence(sequence) for sequence in reply_sequences]
     combined_reply_text = "".join(reply_segments)
     sent_message_ids: list[str] = []
@@ -280,7 +280,6 @@ async def handle_tool(
         selected_expression_ids=reply_result.selected_expression_ids,
         expression_habits=_get_selected_expression_habits(reply_result),
     )
-    tool_ctx.runtime._record_reply_sent()
     reply_metadata["sent_message_ids"] = sent_message_ids
     reply_metadata["send_results"] = send_results
     track_reply_effect = getattr(tool_ctx.runtime, "track_reply_effect", None)

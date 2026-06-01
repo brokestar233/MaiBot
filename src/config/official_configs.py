@@ -196,6 +196,70 @@ class PersonalityConfig(ConfigBase):
     )
     """每次构建回复时，从 multiple_reply_style 中随机替换 reply_style 的概率（0.0-1.0）"""
 
+
+class ImageCacheCleanupConfig(ConfigBase):
+    """图片缓存自动清理配置。"""
+
+    enabled: bool = Field(
+        default=True,
+        json_schema_extra={
+            "x-widget": "switch",
+            "x-icon": "trash-2",
+            "label": {
+                "zh_CN": "启用图片缓存自动清理",
+                "en_US": "Enable image cache cleanup",
+                "ja_JP": "画像キャッシュ自動クリーンアップを有効化",
+            },
+        },
+    )
+    """是否启用图片缓存自动清理。"""
+
+    check_interval_hours: float = Field(
+        default=6.0,
+        ge=1.0 / 60.0,
+        json_schema_extra={
+            "x-widget": "input",
+            "x-icon": "clock",
+            "label": {
+                "zh_CN": "清理检查间隔（小时）",
+                "en_US": "Cleanup check interval (hours)",
+                "ja_JP": "クリーンアップ確認間隔（時間）",
+            },
+        },
+    )
+    """图片缓存自动清理任务的轮询间隔，单位为小时。"""
+
+    image_file_retention_days: int = Field(
+        default=14,
+        ge=1,
+        json_schema_extra={
+            "x-widget": "input",
+            "x-icon": "calendar-days",
+            "label": {
+                "zh_CN": "图片文件保留天数",
+                "en_US": "Image file retention days",
+                "ja_JP": "画像ファイル保持日数",
+            },
+        },
+    )
+    """图片文件超过该天数未使用后会被删除，但识别结果会继续保留。"""
+
+    no_file_result_retention_days: int = Field(
+        default=30,
+        ge=1,
+        json_schema_extra={
+            "x-widget": "input",
+            "x-icon": "database",
+            "label": {
+                "zh_CN": "无文件识别结果保留天数",
+                "en_US": "No-file recognition retention days",
+                "ja_JP": "ファイルなし認識結果保持日数",
+            },
+        },
+    )
+    """图片文件被清理或缺失后，识别结果继续保留的天数。"""
+
+
 class VisualConfig(ConfigBase):
     """视觉配置类"""
 
@@ -223,6 +287,22 @@ class VisualConfig(ConfigBase):
         },
     )
     """回复器模式，auto根据模型信息自动选择，text为纯文本模式，multimodal为多模态模式"""
+
+    max_image_num: int = Field(
+        default=128,
+        ge=0,
+        json_schema_extra={
+            "advanced": True,
+            "x-widget": "input",
+            "x-icon": "images",
+            "label": {
+                "zh_CN": "多模态最大图片数",
+                "en_US": "Max multimodal images",
+                "ja_JP": "マルチモーダル最大画像数",
+            },
+        },
+    )
+    """多模态请求中最多保留的图片数量；只保留最新图片，超出数量的旧图片会显示为 [图片]。"""
 
     wait_image_recognize_max_time: float = Field(
         default=10,
@@ -290,6 +370,9 @@ class VisualConfig(ConfigBase):
     )
     """接收图片超过最大图片大小时的处理方法：compress 为压缩，discard 为丢弃。"""
 
+    image_cache_cleanup: ImageCacheCleanupConfig = Field(default_factory=ImageCacheCleanupConfig)
+    """图片缓存自动清理配置。"""
+
 
 class TalkRulesItem(ConfigBase):
     platform: str = Field(
@@ -302,7 +385,7 @@ class TalkRulesItem(ConfigBase):
             },
         },
     )
-    """平台，与ID一起留空表示全局"""
+    """平台，与 ID 一起留空表示全局；单独填写时表示该平台下所有聊天流的默认值，"*" 表示平台通配覆盖。"""
 
     item_id: str = Field(
         default="",
@@ -314,7 +397,7 @@ class TalkRulesItem(ConfigBase):
             },
         },
     )
-    """用户ID，与平台一起留空表示全局"""
+    """聊天流 ID，与平台一起留空表示全局；单独填写时表示该聊天流 ID 在所有平台下的默认值，"*" 表示聊天流通配覆盖。"""
 
     rule_type: Literal["group", "private"] = Field(
         default="group",
@@ -338,9 +421,10 @@ class TalkRulesItem(ConfigBase):
                 "en_US": "Time range",
                 "ja_JP": "時間帯",
             },
+            "x-widget": "talk-time",
         },
     )
-    """时间段，格式为 "HH:MM-HH:MM"，支持跨夜区间"""
+    """留空表示兜底，"HH:MM-HH:MM" 表示指定时间段，"*" 表示强制全天覆盖。支持跨夜区间。"""
 
     value: float = Field(
         default=0.5,
@@ -374,7 +458,7 @@ class ChatConfig(ConfigBase):
             "x-widget": "slider",
             "x-icon": "message-circle",
             "x-row": "talk-values",
-            "step": 0.1,
+            "step": 0.001,
         },
     )
     """聊天频率，越小越沉默，范围0-1"""
@@ -392,7 +476,7 @@ class ChatConfig(ConfigBase):
             "x-widget": "slider",
             "x-icon": "message-circle",
             "x-row": "talk-values",
-            "step": 0.1,
+            "step": 0.001,
         },
     )
     """私聊聊天频率，越小越沉默，范围0-1"""
@@ -522,22 +606,25 @@ class ChatConfig(ConfigBase):
             "x-description-display": "icon",
         },
     )
-    """开启后启用独立 Timing Gate；关闭后不再单独运行 Timing Gate，并将节奏控制工具合并到 Planner"""
+    """开启后对回复时机判定更精确，可能消耗更多token"""
 
-    enable_at: bool = Field(
-        default=True,
+    enable_replyer_format_output: bool = Field(
+        default=False,
         json_schema_extra={
             "label": {
-                "zh_CN": "允许发送 At",
-                "en_US": "Allow sending @",
-                "ja_JP": "@ 送信を許可",
+                "zh_CN": "Replyer 格式化输出",
+                "en_US": "Replyer formatted output",
+                "ja_JP": "Replyer フォーマット出力",
             },
             "x-widget": "switch",
-            "x-icon": "at-sign",
+            "x-icon": "braces",
             "advanced": True,
         },
     )
-    """是否允许 replyer 使用 at[msg_id] 标记来发送真正的 at 消息"""
+    """
+    是否允许 replyer 输出 <text>、<at>、<emoji>、<image> 等格式化片段，
+    并在发送前解析为真实消息组件，可能会影响回复表现
+    """
 
     enable_reply_quote: bool = Field(
         default=True,
@@ -662,7 +749,7 @@ class ChatConfig(ConfigBase):
             "advanced": True,
         },
     )
-    """Planner 连续被新消息打断的最大次数，0 表示不启用打断"""
+    """planner如果遇到新消息，重新开始思考的次数"""
 
     timing_gate_non_continue_cooldown_seconds: float = Field(
         default=8,
@@ -679,7 +766,7 @@ class ChatConfig(ConfigBase):
             "advanced": False,
         },
     )
-    """这个值决定了 timing gate 判断的频率，值越大，timing gate 的判断越平滑，但也可能导致反应变慢。建议根据实际情况调整，找到一个既能保持反应及时又不过于频繁的平衡点。"""
+    """这个值决定了Timing Gate判断的最低时间间隔"""
 
     group_chat_prompt: str = Field(
         default=(
@@ -2022,6 +2109,75 @@ class AMemorixAdvancedConfig(ConfigBase):
     """是否启用调试"""
 
 
+class AMemorixWebImportTimeoutConfig(ConfigBase):
+    """A_Memorix 导入中心超时配置"""
+
+    llm_call_seconds: float = Field(
+        default=240.0,
+        ge=0.0,
+        json_schema_extra={
+            "label": {
+                "zh_CN": "LLM 单次调用超时",
+                "en_US": "LLM call timeout",
+                "ja_JP": "LLM 呼び出しタイムアウト",
+            },
+        },
+    )
+    """Web 导入中单次 LLM 抽取调用的超时时间，0 表示不额外限制"""
+
+    process_poll_seconds: float = Field(
+        default=1.0,
+        ge=0.1,
+        json_schema_extra={
+            "label": {
+                "zh_CN": "子进程轮询等待",
+                "en_US": "Process poll wait",
+                "ja_JP": "子プロセス待機ポーリング",
+            },
+        },
+    )
+    """迁移或转换子进程状态轮询等待时间"""
+
+    process_terminate_seconds: float = Field(
+        default=5.0,
+        ge=0.1,
+        json_schema_extra={
+            "label": {
+                "zh_CN": "子进程终止等待",
+                "en_US": "Process terminate wait",
+                "ja_JP": "子プロセス終了待機",
+            },
+        },
+    )
+    """取消任务时等待子进程正常终止的时间"""
+
+    process_kill_seconds: float = Field(
+        default=3.0,
+        ge=0.1,
+        json_schema_extra={
+            "label": {
+                "zh_CN": "子进程强杀等待",
+                "en_US": "Process kill wait",
+                "ja_JP": "子プロセス強制終了待機",
+            },
+        },
+    )
+    """取消任务时强制结束子进程后的等待时间"""
+
+    convert_preflight_seconds: float = Field(
+        default=20.0,
+        ge=0.1,
+        json_schema_extra={
+            "label": {
+                "zh_CN": "转换预检超时",
+                "en_US": "Convert preflight timeout",
+                "ja_JP": "変換事前チェックタイムアウト",
+            },
+        },
+    )
+    """LPMM 转换依赖预检的超时时间"""
+
+
 class AMemorixWebImportConfig(ConfigBase):
     """A_Memorix 导入中心配置"""
 
@@ -2114,6 +2270,18 @@ class AMemorixWebImportConfig(ConfigBase):
         },
     )
     """默认分块并发"""
+
+    timeout: AMemorixWebImportTimeoutConfig = Field(
+        default_factory=AMemorixWebImportTimeoutConfig,
+        json_schema_extra={
+            "label": {
+                "zh_CN": "导入超时",
+                "en_US": "Import timeouts",
+                "ja_JP": "インポートタイムアウト",
+            },
+        },
+    )
+    """导入中心超时配置"""
 
 
 class AMemorixWebTuningConfig(ConfigBase):
@@ -3082,7 +3250,7 @@ class LogConfig(ConfigBase):
     """完全屏蔽日志的第三方库列表"""
 
     library_log_levels: dict[str, str] = Field(
-        default_factory=lambda: {"aiohttp": "WARNING"},
+        default_factory=lambda: {"aiohttp": "WARNING", "PIL": "WARNING"},
         json_schema_extra={
             "x-widget": "custom",
             "x-icon": "sliders-horizontal",
@@ -3540,6 +3708,19 @@ class WebUIConfig(ConfigBase):
         },
     )
     """运行模式：development(开发) 或 production(生产)"""
+
+    webui_style: int = Field(
+        default=1,
+        ge=0,
+        le=1,
+        json_schema_extra={
+            "x-widget": "number",
+            "x-icon": "palette",
+            "x-layout": "inline-right",
+            "x-input-width": "8rem",
+        },
+    )
+    """WebUI界面风格：0为当前风格，1为未来复古"""
 
     anti_crawler_mode: Literal["false", "strict", "loose", "basic"] = Field(
         default="basic",
