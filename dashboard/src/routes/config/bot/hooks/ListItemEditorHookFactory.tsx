@@ -10,6 +10,12 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import { DynamicConfigForm } from '@/components/dynamic-form/DynamicConfigForm'
 import { fieldTitleClassName } from '@/components/dynamic-form/fieldStyle'
 import { resolveLocalizedText } from '@/lib/config-label'
@@ -29,6 +35,8 @@ export interface ListItemEditorOptions {
   addLabel?: string
   /** 顶部辅助说明 */
   helperText?: string
+  /** 标题旁信息图标说明 */
+  infoText?: string
   /** 列表为空时的占位说明 */
   emptyText?: string
   /** 顶部图标（覆盖 schema 自带的 x-icon） */
@@ -37,6 +45,8 @@ export interface ListItemEditorOptions {
   fieldRows?: string[][]
   /** Hook-local field UI metadata overrides */
   fieldSchemaOverrides?: Record<string, Partial<FieldSchema>>
+  /** 后端 schema 暂时缺失时用于维持富编辑器可用的本地子项 schema */
+  fallbackNestedSchema?: ConfigSchema
   /** 添加按钮位置 */
   addButtonPlacement?: 'top' | 'bottom' | 'none'
   /** 根据同级配置决定是否默认折叠 */
@@ -102,11 +112,9 @@ function resolveDescription(schema?: ConfigSchema | FieldSchema): string {
 function resolveIconName(
   iconOverride: string | undefined,
   schema?: ConfigSchema | FieldSchema,
-  nested?: ConfigSchema,
 ): string | undefined {
   if (iconOverride) return iconOverride
   if (schema && 'x-icon' in schema && schema['x-icon']) return schema['x-icon']
-  if (nested?.uiIcon) return nested.uiIcon
   return undefined
 }
 
@@ -196,6 +204,7 @@ export function createListItemEditorHook(
     parentValues,
     value,
   }) => {
+    const effectiveNestedSchema = nestedSchema ?? options.fallbackNestedSchema
     const items = useMemo<Record<string, unknown>[]>(() => {
       if (!Array.isArray(value)) return []
       return value.map((item) =>
@@ -213,16 +222,16 @@ export function createListItemEditorHook(
     )
 
     const handleAdd = useCallback(() => {
-      const next = [...items, buildDefaultItem(nestedSchema)]
+      const next = [...items, buildDefaultItem(effectiveNestedSchema)]
       emitItems(next, { addedIndex: next.length - 1 })
-    }, [emitItems, items, nestedSchema])
+    }, [effectiveNestedSchema, emitItems, items])
 
     const handleAddItem = useCallback(
       (item: Record<string, unknown> = {}) => {
-        const next = [...items, { ...buildDefaultItem(nestedSchema), ...item }]
+        const next = [...items, { ...buildDefaultItem(effectiveNestedSchema), ...item }]
         emitItems(next, { addedIndex: next.length - 1 })
       },
-      [emitItems, items, nestedSchema],
+      [effectiveNestedSchema, emitItems, items],
     )
 
     const handleRemove = useCallback(
@@ -247,14 +256,14 @@ export function createListItemEditorHook(
     )
 
     const renderItemEditor = (item: Record<string, unknown>, index: number) => {
-      if (!nestedSchema) {
+      if (!effectiveNestedSchema) {
         return null
       }
 
       if (!options.fieldRows?.length) {
         return (
           <DynamicConfigForm
-            schema={nestedSchema}
+            schema={effectiveNestedSchema}
             values={item}
             onChange={(field, fieldValue) =>
               handleItemFieldChange(index, field, fieldValue)
@@ -270,14 +279,14 @@ export function createListItemEditorHook(
         ...(options.fieldSchemaOverrides?.[field.name] ?? {}),
       })
       const fieldMap = new Map(
-        nestedSchema.fields.map((field) => [field.name, applyFieldOverride(field)]),
+        effectiveNestedSchema.fields.map((field) => [field.name, applyFieldOverride(field)]),
       )
       const rowFieldNames = new Set(options.fieldRows.flat())
-      const remainingFields = nestedSchema.fields
+      const remainingFields = effectiveNestedSchema.fields
         .filter((field) => !rowFieldNames.has(field.name))
         .map(applyFieldOverride)
       const buildRowSchema = (fields: FieldSchema[]): ConfigSchema => ({
-        ...nestedSchema,
+        ...effectiveNestedSchema,
         fields,
         nested: undefined,
       })
@@ -331,7 +340,7 @@ export function createListItemEditorHook(
 
     const label = resolveLabel(schema, fieldPath)
     const description = resolveDescription(schema)
-    const iconName = resolveIconName(options.iconName, schema, nestedSchema)
+    const iconName = resolveIconName(options.iconName, schema)
     const addButtonPlacement = options.addButtonPlacement ?? 'bottom'
     const shouldCollapse = options.collapseWhen?.({ parentValues }) ?? false
     const [manuallyExpanded, setManuallyExpanded] = useState(false)
@@ -359,7 +368,7 @@ export function createListItemEditorHook(
       </Button>
     )
 
-    if (!nestedSchema) {
+    if (!effectiveNestedSchema) {
       return (
         <Card>
           <CardHeader>
@@ -377,6 +386,28 @@ export function createListItemEditorHook(
             <div className="flex min-w-0 items-center gap-2">
               {renderLucideIcon(iconName, 'h-5 w-5 flex-shrink-0 text-muted-foreground')}
               <CardTitle className={fieldTitleClassName(schema, 'truncate text-base')}>{label}</CardTitle>
+              {options.infoText && (
+                <TooltipProvider delayDuration={150}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        aria-label={`${label} 说明`}
+                        className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        <LucideIcons.CircleAlert className="h-4 w-4" />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent
+                      side="right"
+                      align="center"
+                      className="max-w-80 whitespace-pre-line bg-popover text-popover-foreground"
+                    >
+                      {options.infoText}
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              )}
             </div>
             {shouldCollapse && options.collapseButtonDisplay === 'icon' && (
               <Button
@@ -457,20 +488,18 @@ export function createListItemEditorHook(
                 >
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2 text-sm font-semibold">
-                      <span className="inline-flex h-6 min-w-6 items-center justify-center rounded-full bg-muted px-2 text-xs font-medium text-muted-foreground">
-                        {index + 1}
-                      </span>
                       <span className="truncate">{title}</span>
                     </div>
                     <Button
                       type="button"
                       variant="ghost"
-                      size="sm"
+                      size="icon"
                       className="text-destructive hover:text-destructive"
+                      aria-label={`删除${title}`}
+                      title={`删除${title}`}
                       onClick={() => handleRemove(index)}
                     >
-                      <Trash2 className="mr-1 h-4 w-4" />
-                      删除
+                      <Trash2 className="h-4 w-4" />
                     </Button>
                   </div>
                   {renderItemEditor(item, index)}

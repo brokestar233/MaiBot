@@ -11,6 +11,7 @@ from src.common.data_models.message_component_data_model import (
     AtComponent,
     DictComponent,
     EmojiComponent,
+    FileComponent,
     ForwardComponent,
     ForwardNodeComponent,
     ImageComponent,
@@ -127,6 +128,9 @@ class PluginMessageUtils:
                 serialized["binary_data_base64"] = base64.b64encode(component.binary_data).decode("utf-8")
             return serialized
 
+        if isinstance(component, FileComponent):
+            return {"type": "file", "data": component.to_payload()}
+
         if isinstance(component, AtComponent):
             return {
                 "type": "at",
@@ -172,12 +176,11 @@ class PluginMessageUtils:
             return ""
 
         try:
-            from pathlib import Path
-
             from sqlmodel import select
 
             from src.common.database.database import get_db_session
             from src.common.database.database_model import Images, ImageType
+            from src.common.utils.image_path import resolve_stored_image_path
 
             target_image_type = ImageType.IMAGE if image_type == "image" else ImageType.EMOJI
             with get_db_session(auto_commit=False) as db:
@@ -186,7 +189,7 @@ class PluginMessageUtils:
             if image_record is None or image_record.no_file_flag:
                 return ""
 
-            image_path = Path(image_record.full_path)
+            image_path = resolve_stored_image_path(image_record.full_path)
             if not image_path.is_file():
                 return ""
             return base64.b64encode(image_path.read_bytes()).decode("utf-8")
@@ -253,6 +256,12 @@ class PluginMessageUtils:
 
         if item_type == "voice":
             return PluginMessageUtils._build_binary_component(VoiceComponent, item)
+
+        if item_type == "file":
+            item_data = item.get("data")
+            if isinstance(item_data, dict):
+                return FileComponent.from_payload(item_data)
+            return FileComponent(name=str(item_data or ""))
 
         if item_type == "at":
             item_data = item.get("data", {})
@@ -321,6 +330,10 @@ class PluginMessageUtils:
 
         component_data = item.get("data")
         if isinstance(component_data, dict):
+            if str(component_data.get("type") or "").strip().lower() == "file":
+                raw_payload = component_data.get("data", component_data)
+                if isinstance(raw_payload, dict):
+                    return FileComponent.from_payload(raw_payload)
             return DictComponent(data=component_data)
         return DictComponent(data=item)
 

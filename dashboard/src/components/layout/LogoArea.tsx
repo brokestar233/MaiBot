@@ -7,10 +7,13 @@ interface LogoAreaProps {
 
 export function LogoArea({ sidebarOpen }: LogoAreaProps) {
   return (
-    <div data-dashboard-logo-area="true" className="flex h-20 items-center border-b px-4">
+    <div
+      data-dashboard-logo-area="true"
+      className="flex h-[var(--layout-sidebar-logo-height)] items-center border-b px-[var(--layout-sidebar-logo-padding-x)]"
+    >
       <div
         className={cn(
-          'relative flex items-center justify-center flex-1 transition-all overflow-hidden',
+          'relative flex flex-1 items-center justify-center overflow-hidden',
           // 移动端始终完整显示,桌面端根据 sidebarOpen 切换
           'lg:flex-1',
           !sidebarOpen && 'lg:flex-none lg:w-8'

@@ -43,7 +43,7 @@ export interface InstalledPlugin {
     homepage_url?: string
     repository_url?: string
     keywords?: string[]
-    plugin_type?: PluginType
+    plugin_type?: PluginType | string
     display?: PluginDisplay
     [key: string]: unknown  // 允许其他字段
   }
@@ -51,7 +51,13 @@ export interface InstalledPlugin {
   enabled?: boolean
   disabled?: boolean
   loaded?: boolean
-  load_status?: 'success' | 'failed' | 'inactive' | 'disabled' | 'unknown'
+  load_status?: 'success' | 'failed' | 'inactive' | 'disabled' | 'unknown' | 'loading'
+  circuit_status?: {
+    state: 'open' | 'half_open'
+    remaining_sec: number
+    cooldown_level: number
+    half_open_inflight: boolean
+  } | null
 }
 /**
  * 旧版本插件格式(直接包含 version 字段)
@@ -74,6 +80,12 @@ export interface PluginLoadProgress {
   plugin_id?: string
   total_plugins: number
   loaded_plugins: number
+  mirror_id?: string
+  mirror_name?: string
+  mirror_index?: number
+  total_mirrors?: number
+  attempt?: number
+  max_attempts?: number
 }
 
 /**
@@ -84,6 +96,15 @@ export interface ItemFieldDefinition {
   label?: string
   placeholder?: string
   default?: unknown
+  multiple?: boolean
+  choices?: unknown[]
+  min?: number
+  max?: number
+  step?: number
+  item_type?: string
+  item_fields?: Record<string, ItemFieldDefinition>
+  min_items?: number
+  max_items?: number
   i18n?: Record<string, Record<string, string>>
 }
 
@@ -97,6 +118,7 @@ export interface ConfigFieldSchema {
   description: string
   example?: string
   required: boolean
+  multiple?: boolean
   choices?: unknown[]
   min?: number
   max?: number
@@ -174,4 +196,22 @@ export interface PluginConfigSchema {
   sections: Record<string, ConfigSectionSchema>
   layout: ConfigLayoutSchema
   _note?: string
+}
+
+export type PluginRuntimeComponentType = 'action' | 'command' | 'tool'
+
+export interface PluginRuntimeComponent {
+  name: string
+  description: string
+  enabled: boolean
+  plugin_name: string
+  component_type: PluginRuntimeComponentType
+  action_parameters?: Record<string, string>
+  action_require?: string[]
+  associated_types?: string[]
+  activation_type?: string
+  random_activation_probability?: number
+  activation_keywords?: string[]
+  parallel_action?: boolean
+  parameters_schema?: Record<string, unknown>
 }

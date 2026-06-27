@@ -3,30 +3,189 @@
 from html import unescape
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
+import base64
 import json
+import os
 import re
+import shutil
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlmodel import Session, col, select
 
+from src.common.data_models.llm_service_data_models import LLMServiceRequest
 from src.common.database.database import get_db_session
 from src.common.database.database_model import ChatSession, Messages
+from src.config.config import config_manager
+from src.services.llm_service import generate as generate_llm_response
+from src.services.service_task_resolver import get_available_models
 from src.webui.dependencies import require_auth
+from src.webui.routers.avatar import build_webui_avatar_url
 
 router = APIRouter(prefix="/reasoning-process", tags=["reasoning-process"], dependencies=[Depends(require_auth)])
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 PROMPT_LOG_ROOT = (PROJECT_ROOT / "logs" / "maisaka_prompt").resolve()
-ALLOWED_SUFFIXES = {".txt", ".html"}
+REPLAY_IMAGE_ROOTS = (
+    (PROJECT_ROOT / "data" / "images").resolve(),
+    (PROJECT_ROOT / "data" / "emoji").resolve(),
+    (PROJECT_ROOT / "data" / "prompt_imgs").resolve(),
+    (PROJECT_ROOT / "data" / "html_imgs").resolve(),
+)
+ALLOWED_SUFFIXES = {".txt", ".html", ".json"}
 SESSION_CHAT_TYPES = ("group", "private")
+ALL_GROUP_SESSIONS = "__all_group_chats__"
+BEHAVIOR_REFERENCE_MARKER = "[行为表现参考]"
 PROMPT_METADATA_MARKER = "[请求信息]"
 PROMPT_SEPARATOR = "=" * 80
 PROMPT_METADATA_SCRIPT_PATTERN = re.compile(
     r"<script[^>]*id=[\"']prompt-preview-metadata[\"'][^>]*>(?P<payload>.*?)</script>",
     re.IGNORECASE | re.DOTALL,
 )
+MESSAGE_TAG_PATTERN = re.compile(r"<message\b(?P<attrs>[^>]*)>", re.IGNORECASE)
+MESSAGE_TAG_ATTR_PATTERN = re.compile(r'([A-Za-z_][\w:-]*)\s*=\s*"([^"]*)"')
+
+
+def _structured_prompt_content_to_text(content: Any) -> str:
+    """将 Prompt JSON 的结构化 content 转为展示/检索用文本。"""
+
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+                continue
+            if isinstance(item, dict) and str(item.get("type") or "").lower() in {"image", "image_url", "input_image"}:
+                image_format = str(item.get("image_format") or item.get("format") or "").strip() or "unknown"
+                size_bytes = item.get("size_bytes")
+                size_text = f" {size_bytes} B" if isinstance(size_bytes, int) else ""
+                parts.append(f"[图片 image/{image_format}{size_text}]")
+                continue
+            try:
+                parts.append(json.dumps(item, ensure_ascii=False, indent=2, default=str))
+            except Exception:
+                parts.append(str(item))
+        return "\n".join(part for part in parts if part).strip()
+    try:
+        return json.dumps(content, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        return str(content)
+
+
+def _format_count_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if value is None:
+        return "无"
+    return str(value)
+
+
+def _format_jargon_learning_entry(entry: Any, index: int) -> str:
+    if not isinstance(entry, dict):
+        return f"{index}. {_structured_prompt_content_to_text(entry) or '空条目'}"
+
+    content = str(entry.get("content") or "").strip() or "空词条"
+    parts = [f"{index}. {content}"]
+    source_id = str(entry.get("source_id") or "").strip()
+    if source_id:
+        parts.append(f"source_id={source_id}")
+    reason = str(entry.get("reason") or "").strip()
+    if reason:
+        parts.append(f"原因: {reason}")
+
+    raw_content = entry.get("raw_content")
+    if isinstance(raw_content, list):
+        parts.append(f"原始上下文 {len(raw_content)} 条")
+    evidence_messages = entry.get("evidence_messages")
+    if isinstance(evidence_messages, list):
+        parts.append(f"证据消息 {len(evidence_messages)} 条")
+    return "；".join(parts)
+
+
+def _format_jargon_learning_entries(title: str, entries: Any) -> str:
+    if not isinstance(entries, list) or not entries:
+        return f"[{title}]\n无"
+
+    lines = [f"[{title}]"]
+    lines.extend(_format_jargon_learning_entry(entry, index) for index, entry in enumerate(entries, start=1))
+    return "\n".join(lines)
+
+
+def _is_jargon_learning_update_payload(payload: dict[str, Any]) -> bool:
+    return str(payload.get("record_type") or "").strip() == "jargon_learning_update"
+
+
+def _is_jargon_learning_update_preview_payload(payload: dict[str, Any]) -> bool:
+    request = payload.get("request")
+    return isinstance(request, dict) and request.get("kind") == "jargon_learning_update"
+
+
+def _build_jargon_learning_update_preview_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """将黑话学习更新日志包装成 dashboard 可展示的 Prompt JSON 结构。"""
+
+    session_name = str(payload.get("session_name") or payload.get("learning_session_id") or "").strip()
+    status = str(payload.get("status") or "").strip() or "unknown"
+    wrote_database = payload.get("wrote_database")
+    summary_lines = [
+        "这是黑话学习更新过程日志，不是可重放的 LLM prompt。",
+        f"状态: {status}",
+        f"会话: {session_name or '未知'}",
+        f"创建时间: {_format_count_value(payload.get('created_at'))}",
+        f"学习素材数: {_format_count_value(payload.get('source_item_count'))}",
+        f"解析候选: {_format_count_value(payload.get('parsed_entry_count'))}",
+        f"接受条目: {_format_count_value(payload.get('accepted_entry_count'))}",
+        f"跳过条目: {_format_count_value(payload.get('skipped_entry_count'))}",
+        f"新增: {_format_count_value(payload.get('saved'))}",
+        f"更新: {_format_count_value(payload.get('updated'))}",
+        f"写入数据库: {_format_count_value(wrote_database)}",
+    ]
+    details = "\n\n".join(
+        [
+            "\n".join(summary_lines),
+            _format_jargon_learning_entries("解析候选", payload.get("parsed_entries")),
+            _format_jargon_learning_entries("接受条目", payload.get("accepted_entries")),
+            _format_jargon_learning_entries("跳过条目", payload.get("skipped_entries")),
+        ]
+    )
+    preview_payload = {
+        "schema_version": payload.get("schema_version") or 1,
+        "request": {
+            "kind": "jargon_learning_update",
+            "selection_reason": "\n".join(summary_lines),
+        },
+        "metadata": {},
+        "messages": [],
+        "output": {
+            "title": "黑话学习更新日志",
+            "content": details,
+        },
+        "tool_definitions": [],
+    }
+    return preview_payload
+
+
+def _normalize_prompt_json_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if _is_jargon_learning_update_payload(payload):
+        return _build_jargon_learning_update_preview_payload(payload)
+    return payload
+
+
+def _is_legacy_jargon_learning_update_file(file_path: Path) -> bool:
+    try:
+        content_head = file_path.read_text(encoding="utf-8", errors="replace")[:2048]
+    except OSError:
+        return False
+    return '"record_type"' in content_head and '"jargon_learning_update"' in content_head
 
 
 class ReasoningPromptStageInfo(BaseModel):
@@ -64,8 +223,12 @@ class ReasoningPromptFile(BaseModel):
     timestamp: int | None = None
     text_path: str | None = None
     html_path: str | None = None
+    json_path: str | None = None
     output_preview: str | None = None
     action_preview: str | None = None
+    display_title: str | None = None
+    related_json_paths: list[str] = Field(default_factory=list)
+    has_behavior_choice_insert: bool = False
     model_name: str | None = None
     duration_ms: float | None = None
     size: int = 0
@@ -93,6 +256,23 @@ class ReasoningPromptStagesResponse(BaseModel):
     stage_infos: list[ReasoningPromptStageInfo] = Field(default_factory=list)
 
 
+class ReasoningPromptClearStageResponse(BaseModel):
+    """清空某类推理过程日志的响应。"""
+
+    stage: str
+    deleted_files: int = 0
+
+
+class ReasoningPromptMessageAvatar(BaseModel):
+    """推理过程消息头像信息。"""
+
+    message_id: str
+    platform: str
+    user_id: str
+    display_name: str = ""
+    avatar_url: str | None = None
+
+
 class ReasoningPromptContentResponse(BaseModel):
     """推理过程文本内容响应。"""
 
@@ -102,6 +282,45 @@ class ReasoningPromptContentResponse(BaseModel):
     modified_at: float
     model_name: str | None = None
     duration_ms: float | None = None
+    message_avatars: dict[str, ReasoningPromptMessageAvatar] = Field(default_factory=dict)
+
+
+class ReasoningReplayMessage(BaseModel):
+    """重放调试使用的单条 LLM 消息。"""
+
+    role: str = Field(..., min_length=1)
+    content: Any
+    tool_call_id: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+
+
+class ReasoningReplayRequest(BaseModel):
+    """推理过程重放请求。"""
+
+    source_path: str | None = Field(default=None, description="原始 prompt JSON 相对路径")
+    stage: str = Field(default="", description="原始推理阶段")
+    model_name: str = Field(..., min_length=1, description="要用于重放的模型名称")
+    messages: list[ReasoningReplayMessage] = Field(default_factory=list)
+    tool_definitions: list[dict[str, Any]] = Field(default_factory=list)
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    max_tokens: int | None = Field(default=None, ge=1)
+
+
+class ReasoningReplayResponse(BaseModel):
+    """推理过程重放响应。"""
+
+    success: bool
+    response: str = ""
+    reasoning: str = ""
+    model_name: str = ""
+    tool_calls: list[dict[str, Any]] | None = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    prompt_cache_hit_tokens: int = 0
+    prompt_cache_miss_tokens: int = 0
+    duration_ms: float = 0
+    error: str | None = None
 
 
 def _to_safe_relative_path(relative_path: str) -> Path:
@@ -194,6 +413,8 @@ def _list_session_names(stage: str) -> list[str]:
 
 def _resolve_session_name(session: str, sessions: list[str]) -> str:
     normalized_session = str(session or "").strip()
+    if normalized_session == ALL_GROUP_SESSIONS:
+        return ALL_GROUP_SESSIONS
     if not normalized_session or normalized_session in {"all", "auto"}:
         return sessions[0] if sessions else ""
     if not _is_safe_name(normalized_session):
@@ -291,9 +512,10 @@ def _get_chat_name_from_latest_message(session_id: str, db_session: Session) -> 
 
 def _get_chat_name_from_session_record(chat_session: Any | ChatSession) -> str:
     if chat_session.group_id:
-        return f"群聊{chat_session.group_id}"
+        return chat_session.group_name or f"群聊{chat_session.group_id}"
     if chat_session.user_id:
-        return f"用户{chat_session.user_id}的私聊"
+        private_name = chat_session.user_cardname or chat_session.user_nickname or f"用户{chat_session.user_id}"
+        return f"{private_name}的私聊"
     return chat_session.session_id
 
 
@@ -301,9 +523,71 @@ def _get_chat_display_name(chat_session: Any, db_session: Session) -> str:
     chat_manager = _get_chat_manager()
     if name := chat_manager.get_session_name(chat_session.session_id):
         return name
+    session_record_name = _get_chat_name_from_session_record(chat_session)
+    if session_record_name != chat_session.session_id:
+        return session_record_name
     if name := _get_chat_name_from_latest_message(chat_session.session_id, db_session):
         return name
-    return _get_chat_name_from_session_record(chat_session)
+    return session_record_name
+
+
+def _get_session_target_key(session: Any) -> tuple[str, str, str] | None:
+    platform = str(session.platform or "").strip()
+    if not platform:
+        return None
+
+    group_id = str(session.group_id or "").strip()
+    if group_id:
+        return platform, "group", group_id
+
+    user_id = str(session.user_id or "").strip()
+    if user_id:
+        return platform, "private", user_id
+
+    return None
+
+
+def _add_session_candidate(
+    candidates_by_key: dict[tuple[str, str, str], list[Any]],
+    seen_session_ids_by_key: dict[tuple[str, str, str], set[str]],
+    session: Any,
+) -> None:
+    key = _get_session_target_key(session)
+    if key is None or key not in candidates_by_key:
+        return
+
+    session_id = str(session.session_id or "").strip()
+    if not session_id or session_id in seen_session_ids_by_key[key]:
+        return
+
+    seen_session_ids_by_key[key].add(session_id)
+    candidates_by_key[key].append(session)
+
+
+def _load_session_candidates_by_target(
+    target_keys: set[tuple[str, str, str]],
+    db_session: Session,
+) -> dict[tuple[str, str, str], list[Any]]:
+    """批量加载日志目录可能对应的真实聊天流候选。"""
+
+    candidates_by_key: dict[tuple[str, str, str], list[Any]] = {key: [] for key in target_keys}
+    seen_session_ids_by_key: dict[tuple[str, str, str], set[str]] = {key: set() for key in target_keys}
+    if not target_keys:
+        return candidates_by_key
+
+    chat_manager = _get_chat_manager()
+    for session in chat_manager.sessions.values():
+        _add_session_candidate(candidates_by_key, seen_session_ids_by_key, session)
+
+    platforms = sorted({platform for platform, _chat_type, _target_id in target_keys})
+    if not platforms:
+        return candidates_by_key
+
+    statement = select(ChatSession).where(col(ChatSession.platform).in_(platforms))
+    for db_instance in db_session.exec(statement).all():
+        _add_session_candidate(candidates_by_key, seen_session_ids_by_key, db_instance)
+
+    return candidates_by_key
 
 
 def _fallback_session_display_name(name: str, parsed: tuple[str, str, str] | None) -> str:
@@ -412,13 +696,367 @@ def _extract_prompt_metadata_from_html(content: str) -> dict[str, object]:
     return _extract_prompt_metadata_from_text(plain_text)
 
 
+def _load_prompt_json(file_path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(file_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return _normalize_prompt_json_payload(payload) if isinstance(payload, dict) else {}
+
+
+def _parse_message_tag_attrs(text: str) -> list[dict[str, str]]:
+    attrs_list: list[dict[str, str]] = []
+    for tag_match in MESSAGE_TAG_PATTERN.finditer(text):
+        attrs: dict[str, str] = {}
+        for attr_match in MESSAGE_TAG_ATTR_PATTERN.finditer(tag_match.group("attrs") or ""):
+            key = attr_match.group(1)
+            value = unescape(attr_match.group(2))
+            if key and value:
+                attrs[key] = value
+        if attrs:
+            attrs_list.append(attrs)
+    return attrs_list
+
+
+def _extract_message_ids_from_prompt_payload(payload: dict[str, Any]) -> list[str]:
+    message_ids: list[str] = []
+    seen: set[str] = set()
+
+    def append_from_text(value: Any) -> None:
+        if not isinstance(value, str) or "<message" not in value:
+            return
+        for attrs in _parse_message_tag_attrs(value):
+            message_id = str(attrs.get("msg_id") or "").strip()
+            if message_id and message_id not in seen:
+                seen.add(message_id)
+                message_ids.append(message_id)
+
+    for message in payload.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        append_from_text(_structured_prompt_content_to_text(message.get("content")))
+
+    output = payload.get("output")
+    if isinstance(output, dict):
+        append_from_text(_structured_prompt_content_to_text(output.get("content")))
+
+    request = payload.get("request")
+    if isinstance(request, dict):
+        append_from_text(request.get("selection_reason"))
+
+    return message_ids
+
+
+def _resolve_content_session_info(relative_path: str) -> ReasoningPromptSessionInfo | None:
+    try:
+        safe_path = _to_safe_relative_path(relative_path)
+    except HTTPException:
+        return None
+
+    parts = safe_path.parts
+    if len(parts) < 3:
+        return None
+
+    stage_name, session_name = parts[0], parts[1]
+    session_infos = _list_session_infos(stage_name, [session_name])
+    return session_infos[0] if session_infos else None
+
+
+def _message_avatar_from_db_record(message: Messages) -> ReasoningPromptMessageAvatar | None:
+    message_id = str(message.message_id or "").strip()
+    platform = str(message.platform or "").strip()
+    user_id = str(message.user_id or "").strip()
+    if not message_id or not platform or not user_id:
+        return None
+
+    display_name = str(message.user_cardname or message.user_nickname or "").strip()
+    return ReasoningPromptMessageAvatar(
+        message_id=message_id,
+        platform=platform,
+        user_id=user_id,
+        display_name=display_name,
+        avatar_url=build_webui_avatar_url(platform, user_id),
+    )
+
+
+def _load_message_avatar_map(
+    *,
+    message_ids: list[str],
+    session_info: ReasoningPromptSessionInfo | None,
+) -> dict[str, ReasoningPromptMessageAvatar]:
+    if not message_ids:
+        return {}
+
+    session_ids = {
+        value
+        for value in {
+            session_info.name if session_info else "",
+            session_info.resolved_session_id if session_info else "",
+        }
+        if value
+    }
+
+    with get_db_session(auto_commit=False) as db_session:
+        statement = select(Messages).where(col(Messages.message_id).in_(message_ids))
+        if session_ids:
+            statement = statement.where(col(Messages.session_id).in_(session_ids))
+        rows = db_session.exec(statement).all()
+
+    avatars: dict[str, ReasoningPromptMessageAvatar] = {}
+    for row in rows:
+        avatar = _message_avatar_from_db_record(row)
+        if avatar is None or avatar.message_id in avatars:
+            continue
+        avatars[avatar.message_id] = avatar
+    return avatars
+
+
+def _load_prompt_message_avatar_map(relative_path: str, content: str) -> dict[str, ReasoningPromptMessageAvatar]:
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    message_ids = _extract_message_ids_from_prompt_payload(payload)
+    if not message_ids:
+        return {}
+
+    return _load_message_avatar_map(
+        message_ids=message_ids,
+        session_info=_resolve_content_session_info(relative_path),
+    )
+
+
+def _json_payload_has_behavior_reference(payload: dict[str, Any]) -> bool:
+    serialized_payload = json.dumps(payload, ensure_ascii=False, default=str)
+    return BEHAVIOR_REFERENCE_MARKER in serialized_payload
+
+
+def _prompt_record_has_behavior_reference(
+    *,
+    stage_name: str,
+    json_payload: dict[str, Any] | None,
+    json_file_path: Path | None,
+) -> bool:
+    if stage_name != "planner":
+        return False
+
+    if json_payload is None and json_file_path is not None:
+        json_payload = _load_prompt_json(json_file_path)
+
+    return json_payload is not None and _json_payload_has_behavior_reference(json_payload)
+
+
+def _extract_prompt_metadata_from_json_payload(payload: dict[str, Any]) -> dict[str, object]:
+    raw_metadata = payload.get("metadata")
+    return _normalize_prompt_metadata(raw_metadata if isinstance(raw_metadata, dict) else {})
+
+
+def _ensure_replay_model_exists(model_name: str) -> str:
+    """确认重放模型存在并返回规范化模型名。"""
+
+    normalized_model_name = model_name.strip()
+    if not any(model.name == normalized_model_name for model in config_manager.get_model_config().models):
+        raise HTTPException(status_code=404, detail=f"未找到模型: {normalized_model_name}")
+    return normalized_model_name
+
+
+def _resolve_replay_task_name(stage: str, model_name: str) -> str:
+    """为重放调试选择一个已存在的任务配置名。"""
+
+    available_tasks = get_available_models()
+    normalized_stage = stage.strip()
+    if normalized_stage in available_tasks:
+        return normalized_stage
+
+    for task_name, task_config in available_tasks.items():
+        if model_name in list(task_config.model_list or []):
+            return task_name
+
+    if available_tasks:
+        return next(iter(available_tasks.keys()))
+    raise HTTPException(status_code=500, detail="没有可用的模型任务配置")
+
+
+def _is_path_in_roots(file_path: Path, roots: tuple[Path, ...]) -> bool:
+    resolved_path = file_path.resolve()
+    for root in roots:
+        try:
+            resolved_path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _resolve_replay_image_path(raw_path: str) -> Path:
+    """解析结构化 prompt 中的图片引用路径，只允许读取预览图片缓存目录。"""
+
+    normalized_path = str(raw_path or "").strip()
+    if not normalized_path:
+        raise ValueError("图片引用缺少 image_path")
+
+    candidate = Path(normalized_path)
+    if not candidate.is_absolute():
+        candidate = PROJECT_ROOT / candidate
+    resolved_path = candidate.resolve()
+    if not _is_path_in_roots(resolved_path, REPLAY_IMAGE_ROOTS):
+        raise ValueError(f"图片引用路径不在允许目录内: {normalized_path}")
+    if not resolved_path.is_file():
+        raise ValueError(f"图片引用文件不存在: {normalized_path}")
+    return resolved_path
+
+
+def _resolve_replay_image_uri(raw_uri: str) -> Path | None:
+    """解析 file:// 图片引用；非 file URI 交给上游图片解析逻辑处理。"""
+
+    normalized_uri = str(raw_uri or "").strip()
+    if not normalized_uri.lower().startswith("file:"):
+        return None
+
+    parsed_uri = urlparse(normalized_uri)
+    uri_path = unquote(parsed_uri.path or "")
+    if os.name == "nt" and uri_path.startswith("/") and re.match(r"^/[A-Za-z]:/", uri_path):
+        uri_path = uri_path[1:]
+    return _resolve_replay_image_path(uri_path)
+
+
+def _infer_image_format(file_path: Path, fallback_format: Any = None) -> str:
+    raw_format = str(fallback_format or "").strip().lower().removeprefix(".")
+    if raw_format:
+        return "jpeg" if raw_format == "jpg" else raw_format
+
+    suffix_format = file_path.suffix.lower().removeprefix(".")
+    if suffix_format:
+        return "jpeg" if suffix_format == "jpg" else suffix_format
+    return "png"
+
+
+def _read_replay_image_base64(file_path: Path) -> str:
+    return base64.b64encode(file_path.read_bytes()).decode("utf-8")
+
+
+def _rehydrate_replay_image_part(content_item: dict[str, Any]) -> dict[str, Any] | None:
+    """把结构化 JSON 中省略 base64 的图片引用还原为 LLMService 可识别的图片片段。"""
+
+    part_type = str(content_item.get("type", "text")).strip().lower()
+    if part_type not in {"image", "image_url", "input_image"}:
+        return None
+
+    image_url = content_item.get("image_url")
+    if isinstance(image_url, dict):
+        image_url_value = image_url.get("url")
+    else:
+        image_url_value = image_url
+
+    if isinstance(content_item.get("image_base64"), str):
+        if isinstance(image_url_value, str) and not image_url_value.startswith("data:image/"):
+            return {key: value for key, value in content_item.items() if key != "image_url"}
+        return content_item
+
+    if isinstance(image_url_value, str) and image_url_value.startswith("data:image/"):
+        return content_item
+
+    image_reference = content_item.get("image_reference")
+    image_reference = image_reference if isinstance(image_reference, dict) else {}
+    image_path = content_item.get("image_path") or image_reference.get("image_path")
+    image_uri = image_url_value or content_item.get("image_uri") or image_reference.get("image_uri")
+
+    resolved_path: Path | None = None
+    if isinstance(image_path, str) and image_path.strip():
+        resolved_path = _resolve_replay_image_path(image_path)
+    elif isinstance(image_uri, str):
+        resolved_path = _resolve_replay_image_uri(image_uri)
+
+    if resolved_path is None:
+        raise ValueError("图片片段缺少可用于重放的 image_path 或 file:// image_uri")
+
+    return {
+        key: value
+        for key, value in content_item.items()
+        if key not in {"image_url", "image_uri", "image_reference"}
+    } | {
+        "type": part_type,
+        "image_format": _infer_image_format(
+            resolved_path,
+            content_item.get("image_format") or image_reference.get("image_format"),
+        ),
+        "image_base64": _read_replay_image_base64(resolved_path),
+    }
+
+
+def _rehydrate_replay_content(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_rehydrate_replay_content(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    image_part = _rehydrate_replay_image_part(value)
+    if image_part is not None:
+        return image_part
+
+    return {key: _rehydrate_replay_content(item) for key, item in value.items()}
+
+
+def _normalize_replay_message(message: ReasoningReplayMessage) -> dict[str, Any]:
+    normalized_message: dict[str, Any] = {
+        "role": message.role.strip().lower(),
+        "content": _rehydrate_replay_content(message.content),
+    }
+    if message.tool_call_id:
+        normalized_message["tool_call_id"] = message.tool_call_id
+    if message.tool_calls:
+        normalized_message["tool_calls"] = message.tool_calls
+    return normalized_message
+
+
+def _decode_json_string_match(value: str) -> str:
+    try:
+        decoded = json.loads(f'"{value}"')
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return value
+    return decoded if isinstance(decoded, str) else value
+
+
+def _extract_prompt_metadata_from_json_head(file_path: Path, read_size: int = 8192) -> dict[str, object]:
+    """从 JSON 文件头部轻量提取列表页所需元数据。"""
+
+    try:
+        with file_path.open("r", encoding="utf-8", errors="replace") as file:
+            content = file.read(read_size)
+    except OSError:
+        return {}
+
+    raw_metadata: dict[str, Any] = {}
+    model_match = re.search(r'"(?:model_name|model)"\s*:\s*"(?P<value>(?:\\.|[^"\\])*)"', content)
+    if model_match:
+        raw_metadata["model_name"] = _decode_json_string_match(model_match.group("value"))
+
+    duration_match = re.search(r'"duration_ms"\s*:\s*(?P<value>-?\d+(?:\.\d+)?)', content)
+    if duration_match:
+        raw_metadata["duration_ms"] = duration_match.group("value")
+
+    return _normalize_prompt_metadata(raw_metadata)
+
+
 def _extract_prompt_metadata(file_path: Path) -> dict[str, object]:
     try:
         content = file_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return {}
 
-    if file_path.suffix.lower() == ".html":
+    suffix = file_path.suffix.lower()
+    if suffix == ".json":
+        try:
+            raw_payload = json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return _extract_prompt_metadata_from_json_payload(
+            _normalize_prompt_json_payload(raw_payload) if isinstance(raw_payload, dict) else {}
+        )
+    if suffix == ".html":
         return _extract_prompt_metadata_from_html(content)
     return _extract_prompt_metadata_from_text(content)
 
@@ -478,6 +1116,37 @@ def _extract_output_text(file_path: Path) -> str | None:
     return _extract_output_text_from_content(content)
 
 
+def _extract_output_text_from_json_payload(payload: dict[str, Any]) -> str | None:
+    output = payload.get("output")
+    if not isinstance(output, dict):
+        return None
+
+    content = output.get("content")
+    if content in (None, "", []):
+        return None
+    if isinstance(content, str):
+        return " ".join(line.strip() for line in content.splitlines() if line.strip()) or None
+    if isinstance(content, dict):
+        response_text = str(content.get("response") or "").strip()
+        if response_text:
+            return " ".join(line.strip() for line in response_text.splitlines() if line.strip()) or None
+    derived_text = _structured_prompt_content_to_text(content)
+    return " ".join(line.strip() for line in derived_text.splitlines() if line.strip()) or None
+
+
+def _extract_output_preview_from_json(file_path: Path, max_chars: int = 160) -> str | None:
+    return _extract_output_preview_from_json_payload(_load_prompt_json(file_path), max_chars=max_chars)
+
+
+def _extract_output_preview_from_json_payload(payload: dict[str, Any], max_chars: int = 160) -> str | None:
+    normalized_output = _extract_output_text_from_json_payload(payload)
+    if not normalized_output:
+        return None
+    if len(normalized_output) <= max_chars:
+        return normalized_output
+    return f"{normalized_output[:max_chars].rstrip()}..."
+
+
 def _extract_output_preview(file_path: Path, max_chars: int = 160) -> str | None:
     """从新版 prompt 预览 txt 中提取输出结果摘要。"""
 
@@ -490,51 +1159,47 @@ def _extract_output_preview(file_path: Path, max_chars: int = 160) -> str | None
     return f"{normalized_output[:max_chars].rstrip()}..."
 
 
-def _extract_action_names_from_output(output_text: str) -> list[str]:
-    """从输出结果中提取实际调用的动作名称。"""
+def _extract_action_names_from_tool_calls(raw_tool_calls: Any) -> list[str]:
+    """从结构化工具调用中提取动作名称。"""
 
-    marker = "工具调用:"
-    marker_index = output_text.find(marker)
-    if marker_index < 0:
-        return []
-
-    raw_tool_calls = output_text[marker_index + len(marker) :].strip()
-    if not raw_tool_calls:
-        return []
-
-    try:
-        parsed_tool_calls, _ = json.JSONDecoder().raw_decode(raw_tool_calls)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return []
-
-    if isinstance(parsed_tool_calls, dict):
-        parsed_tool_calls = [parsed_tool_calls]
-    if not isinstance(parsed_tool_calls, list):
+    if isinstance(raw_tool_calls, dict):
+        raw_tool_calls = [raw_tool_calls]
+    if not isinstance(raw_tool_calls, list):
         return []
 
     action_names: list[str] = []
-    for tool_call in parsed_tool_calls:
+    for tool_call in raw_tool_calls:
         if not isinstance(tool_call, dict):
             continue
-        action_name = str(tool_call.get("name") or "").strip()
+        function_info = tool_call.get("function")
+        action_name = ""
+        if isinstance(function_info, dict):
+            action_name = str(function_info.get("name") or "").strip()
+        if not action_name:
+            action_name = str(tool_call.get("name") or "").strip()
         if action_name:
             action_names.append(action_name)
     return action_names
 
 
-def _extract_action_preview(file_path: Path, max_actions: int = 4) -> str | None:
-    """从 prompt 预览 txt 中提取动作摘要。"""
+def _extract_action_preview_from_json(file_path: Path, max_actions: int = 4) -> str | None:
+    """从 prompt JSON 预览中提取动作摘要。"""
 
-    try:
-        content = file_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
+    return _extract_action_preview_from_json_payload(_load_prompt_json(file_path), max_actions=max_actions)
 
-    output_text = _extract_output_block_from_content(content)
-    if not output_text:
-        return None
 
-    action_names = _extract_action_names_from_output(output_text)
+def _extract_action_preview_from_json_payload(payload: dict[str, Any], max_actions: int = 4) -> str | None:
+    """从 prompt JSON payload 中提取动作摘要。"""
+
+    if _is_jargon_learning_update_preview_payload(payload):
+        return _extract_output_preview_from_json_payload(payload, max_chars=160)
+
+    output = payload.get("output")
+    action_names: list[str] = []
+
+    if isinstance(output, dict):
+        action_names = _extract_action_names_from_tool_calls(output.get("tool_calls"))
+
     if not action_names:
         return None
 
@@ -543,6 +1208,119 @@ def _extract_action_preview(file_path: Path, max_actions: int = 4) -> str | None
     if len(action_names) > max_actions:
         preview = f"{preview} 等 {len(action_names)} 个"
     return preview
+
+
+JARGON_UPDATE_STAGE_ORDER = {"with_context": 0, "content_only": 1, "compare": 2}
+
+
+def _extract_jargon_learning_update_info(payload: dict[str, Any]) -> tuple[str, str]:
+    request = payload.get("request")
+    if not isinstance(request, dict):
+        return "", ""
+
+    selection_reason = str(request.get("selection_reason") or "")
+    jargon_name = ""
+    inference_stage = ""
+    for raw_line in selection_reason.splitlines():
+        line = raw_line.strip()
+        if line.startswith("词条:"):
+            jargon_name = line.split(":", 1)[1].strip()
+            continue
+        if line.startswith("推断阶段:"):
+            inference_stage = line.split(":", 1)[1].strip()
+            continue
+    return jargon_name, inference_stage
+
+
+def _group_jargon_learning_update_records(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    """把同一黑话的一轮三次含义推断合并成一条 WebUI 列表记录。"""
+
+    if not records:
+        return records
+
+    prepared_records: list[dict[str, object]] = []
+    for record in records:
+        if record.get("stage") != "jargon_learning_update" or not isinstance(record.get("json_path"), str):
+            prepared_records.append(record)
+            continue
+
+        json_file_path = _resolve_record_file_path(record, "json_path", {".json"})
+        if json_file_path is None:
+            prepared_records.append(record)
+            continue
+
+        payload = _load_prompt_json(json_file_path)
+        jargon_name, inference_stage = _extract_jargon_learning_update_info(payload)
+        if not jargon_name:
+            prepared_records.append(record)
+            continue
+
+        prepared_record = dict(record)
+        prepared_record["display_title"] = jargon_name
+        prepared_record["_jargon_name"] = jargon_name
+        prepared_record["_inference_stage"] = inference_stage
+        prepared_records.append(prepared_record)
+
+    grouped_records: list[dict[str, object]] = []
+    pending_groups: dict[tuple[str, str], list[dict[str, object]]] = {}
+
+    def flush_group(group_key: tuple[str, str]) -> None:
+        group = pending_groups.pop(group_key, [])
+        if not group:
+            return
+
+        group.sort(
+            key=lambda item: (
+                JARGON_UPDATE_STAGE_ORDER.get(str(item.get("_inference_stage") or ""), 99),
+                float(item.get("modified_at") or 0),
+            )
+        )
+        base = dict(group[-1])
+        related_json_paths = [str(item["json_path"]) for item in group if isinstance(item.get("json_path"), str)]
+        base["related_json_paths"] = related_json_paths
+        base["size"] = sum(int(item.get("size") or 0) for item in group)
+        base["modified_at"] = max(float(item.get("modified_at") or 0) for item in group)
+        timestamps = [int(item["timestamp"]) for item in group if isinstance(item.get("timestamp"), int)]
+        if timestamps:
+            base["timestamp"] = max(timestamps)
+        base["stem"] = str(base.get("stem") or "")
+        base["action_preview"] = str(base.get("display_title") or "")
+        base.pop("_jargon_name", None)
+        base.pop("_inference_stage", None)
+        grouped_records.append(base)
+
+    for record in sorted(prepared_records, key=lambda item: float(item.get("modified_at") or 0)):
+        jargon_name = str(record.get("_jargon_name") or "")
+        inference_stage = str(record.get("_inference_stage") or "")
+        if not jargon_name:
+            grouped_records.append(record)
+            continue
+
+        group_key = (str(record.get("session_id") or ""), jargon_name)
+        group = pending_groups.get(group_key)
+        if group:
+            first_modified_at = float(group[0].get("modified_at") or 0)
+            stage_names = {str(item.get("_inference_stage") or "") for item in group}
+            if (
+                abs(float(record.get("modified_at") or 0) - first_modified_at) > 120
+                or (inference_stage and inference_stage in stage_names)
+                or "compare" in stage_names
+            ):
+                flush_group(group_key)
+
+        pending_groups.setdefault(group_key, []).append(record)
+
+    for group_key in list(pending_groups):
+        flush_group(group_key)
+
+    grouped_records.sort(
+        key=lambda item: (
+            float(item["modified_at"]),
+            int(item["timestamp"]) if isinstance(item.get("timestamp"), int) else 0,
+        ),
+        reverse=True,
+    )
+    return grouped_records
 
 
 def _matches_prompt_file_search(item: ReasoningPromptFile, normalized_search: str) -> bool:
@@ -555,28 +1333,49 @@ def _matches_prompt_file_search(item: ReasoningPromptFile, normalized_search: st
         or normalized_search in (item.resolved_session_id or "").casefold()
         or normalized_search in (item.output_preview or "").casefold()
         or normalized_search in (item.action_preview or "").casefold()
+        or normalized_search in (item.display_title or "").casefold()
         or normalized_search in (item.model_name or "").casefold()
         or normalized_search in (str(item.duration_ms) if item.duration_ms is not None else "")
         or normalized_search in item.stem.casefold()
     ):
         return True
 
-    if item.stage != "replyer" or not item.text_path:
+    if item.stage != "replyer" or not (item.json_path or item.text_path):
         return False
 
     try:
-        file_path = _resolve_prompt_log_path(item.text_path, {".txt"})
+        if item.json_path:
+            file_path = _resolve_prompt_log_path(item.json_path, {".json"})
+            output_text = _extract_output_text_from_json_payload(_load_prompt_json(file_path))
+        else:
+            file_path = _resolve_prompt_log_path(item.text_path or "", {".txt"})
+            output_text = _extract_output_text(file_path)
     except HTTPException:
         return False
 
-    output_text = _extract_output_text(file_path)
     return normalized_search in (output_text or "").casefold()
+
+
+def _matches_prompt_file_action(item: ReasoningPromptFile, normalized_action: str) -> bool:
+    """判断推理过程条目是否匹配动作过滤词。"""
+
+    action_preview = str(item.action_preview or "").strip()
+    if not action_preview:
+        return False
+
+    for prefix in ("动作：", "动作:"):
+        if action_preview.startswith(prefix):
+            action_preview = action_preview[len(prefix) :].strip()
+            break
+
+    return normalized_action in action_preview.casefold()
 
 
 def _resolve_reasoning_session_info(
     name: str,
     *,
     configured_accounts: set[tuple[str, str]],
+    candidates_by_key: dict[tuple[str, str, str], list[Any]],
     db_session: Session,
 ) -> ReasoningPromptSessionInfo:
     parsed = _parse_session_directory_name(name)
@@ -584,12 +1383,7 @@ def _resolve_reasoning_session_info(
         return ReasoningPromptSessionInfo(name=name, display_name=name)
 
     platform, chat_type, target_id = parsed
-    chat_manager = _get_chat_manager()
-    matched_sessions = chat_manager.resolve_sessions_by_target(
-        platform=platform,
-        target_id=target_id,
-        chat_type=chat_type,
-    )
+    matched_sessions = candidates_by_key.get((platform, chat_type, target_id), [])
     matched_session, matched_current_account = _select_current_account_session(matched_sessions, configured_accounts)
 
     if matched_session is None:
@@ -620,86 +1414,278 @@ def _list_session_infos(stage: str, session_names: list[str] | None = None) -> l
         return []
 
     configured_accounts = _get_configured_platform_accounts()
+    parsed_session_names = {
+        name: parsed
+        for name in session_names
+        if (parsed := _parse_session_directory_name(name)) is not None
+    }
+    target_keys = set(parsed_session_names.values())
     with get_db_session(auto_commit=False) as db_session:
+        candidates_by_key = _load_session_candidates_by_target(target_keys, db_session)
         return [
             _resolve_reasoning_session_info(
                 name,
                 configured_accounts=configured_accounts,
+                candidates_by_key=candidates_by_key,
                 db_session=db_session,
             )
             for name in session_names
         ]
 
 
-def _collect_prompt_files(
+def _is_group_session_info(session_name: str, session_info: ReasoningPromptSessionInfo | None) -> bool:
+    if session_info is not None:
+        return session_info.chat_type == "group"
+
+    parsed = _parse_session_directory_name(session_name)
+    return parsed is not None and parsed[1] == "group"
+
+
+def _collect_prompt_file_records_for_session(
     stage: str,
     session: str,
     session_info_map: dict[str, ReasoningPromptSessionInfo],
-) -> list[ReasoningPromptFile]:
+) -> list[dict[str, object]]:
     session_dir = PROMPT_LOG_ROOT / stage / session
     if not session or not session_dir.is_dir():
         return []
 
     records: dict[tuple[str, str, str], dict[str, object]] = {}
 
-    for file_path in session_dir.iterdir():
-        if not file_path.is_file() or file_path.suffix.lower() not in ALLOWED_SUFFIXES:
+    with os.scandir(session_dir) as entries:
+        for entry in entries:
+            if not entry.is_file():
+                continue
+
+            file_path = session_dir / entry.name
+            file_suffix = file_path.suffix.lower()
+            if file_suffix not in ALLOWED_SUFFIXES:
+                continue
+
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+
+            try:
+                relative_path = file_path.relative_to(PROMPT_LOG_ROOT)
+            except ValueError:
+                continue
+
+            parts = relative_path.parts
+            if len(parts) < 3:
+                continue
+
+            stage_name, session_id = parts[0], parts[1]
+            if (
+                stage_name == "jargon_learning_update"
+                and file_suffix == ".json"
+                and _is_legacy_jargon_learning_update_file(file_path)
+            ):
+                continue
+            stem = file_path.stem
+            key = (stage_name, session_id, stem)
+            session_info = session_info_map.get(session_id)
+
+            record = records.setdefault(
+                key,
+                {
+                    "stage": stage_name,
+                    "session_id": session_id,
+                    "resolved_session_id": session_info.resolved_session_id if session_info else None,
+                    "session_display_name": session_info.display_name if session_info else None,
+                    "platform": session_info.platform if session_info else None,
+                    "chat_type": session_info.chat_type if session_info else None,
+                    "target_id": session_info.target_id if session_info else None,
+                    "stem": stem,
+                    "timestamp": int(stem) if stem.isdigit() else None,
+                    "text_path": None,
+                    "html_path": None,
+                    "json_path": None,
+                    "output_preview": None,
+                    "action_preview": None,
+                    "model_name": None,
+                    "duration_ms": None,
+                    "size": 0,
+                    "modified_at": 0.0,
+                },
+            )
+            record["size"] = int(record["size"]) + stat.st_size
+            record["modified_at"] = max(float(record["modified_at"]), stat.st_mtime)
+
+            if file_suffix == ".txt":
+                record["text_path"] = _relative_posix_path(file_path)
+            elif file_suffix == ".html":
+                record["html_path"] = _relative_posix_path(file_path)
+            elif file_suffix == ".json":
+                record["json_path"] = _relative_posix_path(file_path)
+
+    items = list(records.values())
+    items.sort(
+        key=lambda item: (
+            float(item["modified_at"]),
+            int(item["timestamp"]) if isinstance(item.get("timestamp"), int) else 0,
+        ),
+        reverse=True,
+    )
+    return _group_jargon_learning_update_records(items) if stage == "jargon_learning_update" else items
+
+
+def _collect_prompt_file_records(
+    stage: str,
+    session: str,
+    session_info_map: dict[str, ReasoningPromptSessionInfo],
+) -> list[dict[str, object]]:
+    if session != ALL_GROUP_SESSIONS:
+        return _collect_prompt_file_records_for_session(stage, session, session_info_map)
+
+    items: list[dict[str, object]] = []
+    for session_name, session_info in session_info_map.items():
+        if not _is_group_session_info(session_name, session_info):
             continue
+        items.extend(_collect_prompt_file_records_for_session(stage, session_name, session_info_map))
 
-        try:
-            relative_path = file_path.relative_to(PROMPT_LOG_ROOT)
-        except ValueError:
-            continue
-
-        parts = relative_path.parts
-        if len(parts) < 3:
-            continue
-
-        stage_name, session_id = parts[0], parts[1]
-        stem = file_path.stem
-        key = (stage_name, session_id, stem)
-        stat = file_path.stat()
-        session_info = session_info_map.get(session_id)
-
-        record = records.setdefault(
-            key,
-            {
-                "stage": stage_name,
-                "session_id": session_id,
-                "resolved_session_id": session_info.resolved_session_id if session_info else None,
-                "session_display_name": session_info.display_name if session_info else None,
-                "platform": session_info.platform if session_info else None,
-                "chat_type": session_info.chat_type if session_info else None,
-                "target_id": session_info.target_id if session_info else None,
-                "stem": stem,
-                "timestamp": int(stem) if stem.isdigit() else None,
-                "text_path": None,
-                "html_path": None,
-                "output_preview": None,
-                "action_preview": None,
-                "model_name": None,
-                "duration_ms": None,
-                "size": 0,
-                "modified_at": 0.0,
-            },
-        )
-        record["size"] = int(record["size"]) + stat.st_size
-        record["modified_at"] = max(float(record["modified_at"]), stat.st_mtime)
-
-        if file_path.suffix.lower() == ".txt":
-            record["text_path"] = _relative_posix_path(file_path)
-            _merge_prompt_metadata(record, _extract_prompt_metadata(file_path))
-            if stage_name == "replyer":
-                record["output_preview"] = _extract_output_preview(file_path)
-            elif stage_name in {"planner", "timing_gate"}:
-                record["action_preview"] = _extract_action_preview(file_path)
-        elif file_path.suffix.lower() == ".html":
-            record["html_path"] = _relative_posix_path(file_path)
-            _merge_prompt_metadata(record, _extract_prompt_metadata(file_path))
-
-    items = [ReasoningPromptFile(**record) for record in records.values()]
-    items.sort(key=lambda item: (item.modified_at, item.timestamp or 0), reverse=True)
+    items.sort(
+        key=lambda item: (
+            float(item["modified_at"]),
+            int(item["timestamp"]) if isinstance(item.get("timestamp"), int) else 0,
+        ),
+        reverse=True,
+    )
     return items
+
+
+def _resolve_record_file_path(record: dict[str, object], field_name: str, suffixes: set[str]) -> Path | None:
+    relative_path = record.get(field_name)
+    if not isinstance(relative_path, str) or not relative_path:
+        return None
+
+    try:
+        return _resolve_prompt_log_path(relative_path, suffixes)
+    except HTTPException:
+        return None
+
+
+def _hydrate_prompt_file_record(
+    record: dict[str, object],
+    *,
+    include_previews: bool = True,
+    include_action_preview: bool = False,
+    include_output_preview: bool = False,
+) -> ReasoningPromptFile:
+    hydrated_record = dict(record)
+    stage_name = str(hydrated_record["stage"])
+    should_extract_action_preview = include_action_preview and stage_name in {"jargon_learning_update", "planner"}
+    should_extract_output_preview = include_output_preview and stage_name == "replyer"
+    json_payload: dict[str, Any] | None = None
+
+    json_file_path = _resolve_record_file_path(hydrated_record, "json_path", {".json"})
+    if json_file_path is not None:
+        if include_previews or should_extract_action_preview or should_extract_output_preview:
+            json_payload = _load_prompt_json(json_file_path)
+            _merge_prompt_metadata(hydrated_record, _extract_prompt_metadata_from_json_payload(json_payload))
+            if stage_name == "replyer" and (include_previews or should_extract_output_preview):
+                hydrated_record["output_preview"] = _extract_output_preview_from_json_payload(json_payload)
+            elif stage_name == "planner" or _is_jargon_learning_update_preview_payload(json_payload):
+                if not hydrated_record.get("display_title"):
+                    hydrated_record["action_preview"] = _extract_action_preview_from_json_payload(json_payload)
+        else:
+            _merge_prompt_metadata(hydrated_record, _extract_prompt_metadata_from_json_head(json_file_path))
+
+    metadata_missing = not hydrated_record.get("model_name") or hydrated_record.get("duration_ms") is None
+    preview_missing = (
+        (include_previews or should_extract_output_preview)
+        and stage_name == "replyer"
+        and not hydrated_record.get("output_preview")
+    )
+
+    text_file_path = _resolve_record_file_path(hydrated_record, "text_path", {".txt"})
+    if text_file_path is not None and (metadata_missing or preview_missing):
+        _merge_prompt_metadata(hydrated_record, _extract_prompt_metadata(text_file_path))
+        if stage_name == "replyer" and not hydrated_record.get("output_preview"):
+            hydrated_record["output_preview"] = _extract_output_preview(text_file_path)
+        metadata_missing = not hydrated_record.get("model_name") or hydrated_record.get("duration_ms") is None
+
+    html_file_path = _resolve_record_file_path(hydrated_record, "html_path", {".html"})
+    hydrated_record["has_behavior_choice_insert"] = _prompt_record_has_behavior_reference(
+        stage_name=stage_name,
+        json_payload=json_payload,
+        json_file_path=json_file_path,
+    )
+    if html_file_path is not None and metadata_missing:
+        _merge_prompt_metadata(hydrated_record, _extract_prompt_metadata(html_file_path))
+
+    return ReasoningPromptFile(**hydrated_record)
+
+
+def _hydrate_prompt_file_records(
+    records: list[dict[str, object]],
+    *,
+    include_previews: bool = True,
+    include_action_preview: bool = False,
+    include_output_preview: bool = False,
+) -> list[ReasoningPromptFile]:
+    return [
+        _hydrate_prompt_file_record(
+            record,
+            include_previews=include_previews,
+            include_action_preview=include_action_preview,
+            include_output_preview=include_output_preview,
+        )
+        for record in records
+    ]
+
+
+def _deduplicate_replyer_prompt_records(items: list[ReasoningPromptFile]) -> list[ReasoningPromptFile]:
+    """隐藏同一次 replyer 输出的重复预览记录。"""
+
+    deduplicated_items: list[ReasoningPromptFile] = []
+    seen_indexes: dict[tuple[str, str], list[int]] = {}
+
+    for item in items:
+        if item.stage != "replyer" or not item.output_preview:
+            deduplicated_items.append(item)
+            continue
+
+        key = (item.session_id, item.output_preview.strip())
+        existing_index = next(
+            (
+                index
+                for index in seen_indexes.get(key, [])
+                if _is_duplicate_replyer_record_time_close(deduplicated_items[index], item)
+            ),
+            None,
+        )
+        if existing_index is None:
+            seen_indexes.setdefault(key, []).append(len(deduplicated_items))
+            deduplicated_items.append(item)
+            continue
+
+        existing_item = deduplicated_items[existing_index]
+        if _should_replace_duplicate_replyer_record(existing_item, item):
+            deduplicated_items[existing_index] = item
+
+    return deduplicated_items
+
+
+def _is_duplicate_replyer_record_time_close(left: ReasoningPromptFile, right: ReasoningPromptFile) -> bool:
+    left_time = left.timestamp
+    right_time = right.timestamp
+    if left_time is not None and right_time is not None:
+        return abs(left_time - right_time) <= 10_000
+    return abs(left.modified_at - right.modified_at) <= 10
+
+
+def _should_replace_duplicate_replyer_record(existing_item: ReasoningPromptFile, candidate_item: ReasoningPromptFile) -> bool:
+    if existing_item.model_name and not candidate_item.model_name:
+        return False
+    if candidate_item.model_name and not existing_item.model_name:
+        return True
+    if existing_item.duration_ms is not None and candidate_item.duration_ms is None:
+        return False
+    if candidate_item.duration_ms is not None and existing_item.duration_ms is None:
+        return True
+    return candidate_item.modified_at > existing_item.modified_at
 
 
 @router.get("/stages", response_model=ReasoningPromptStagesResponse)
@@ -713,11 +1699,31 @@ async def list_reasoning_prompt_stages():
     )
 
 
+@router.delete("/stages/{stage}", response_model=ReasoningPromptClearStageResponse)
+async def clear_reasoning_prompt_stage(stage: str):
+    """清空指定类型的推理过程日志。"""
+
+    stage_name = _resolve_stage_name(stage)
+    stage_dir = (PROMPT_LOG_ROOT / stage_name).resolve()
+    if not stage_dir.is_relative_to(PROMPT_LOG_ROOT):
+        raise HTTPException(status_code=400, detail="无效的推理过程类型")
+    if not stage_dir.exists():
+        return ReasoningPromptClearStageResponse(stage=stage_name, deleted_files=0)
+    if not stage_dir.is_dir():
+        raise HTTPException(status_code=400, detail="推理过程路径不是目录")
+
+    deleted_files = sum(1 for path in stage_dir.rglob("*") if path.is_file())
+    shutil.rmtree(stage_dir)
+    return ReasoningPromptClearStageResponse(stage=stage_name, deleted_files=deleted_files)
+
+
 @router.get("/files", response_model=ReasoningPromptListResponse)
 async def list_reasoning_prompt_files(
     stage: str = Query("planner"),
     session: str = Query("auto"),
+    action: str = Query(""),
     search: str = Query(""),
+    target_stem: str = Query(""),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=10, le=200),
 ):
@@ -728,21 +1734,69 @@ async def list_reasoning_prompt_files(
     selected_stage = _resolve_stage_name(stage)
     sessions = _list_session_names(selected_stage)
     selected_session = _resolve_session_name(session, sessions)
+    normalized_action = action.strip().casefold()
     normalized_search = search.strip().casefold()
+    normalized_target_stem = target_stem.strip()
     # 下拉菜单需要展示全部会话的真实名称，不能只解析当前选中项。
     session_infos = _list_session_infos(selected_stage, sessions)
     session_info_map = {item.name: item for item in session_infos}
-    items = _collect_prompt_files(selected_stage, selected_session, session_info_map)
+    records = _collect_prompt_file_records(selected_stage, selected_session, session_info_map)
 
-    if normalized_search:
-        items = [item for item in items if _matches_prompt_file_search(item, normalized_search)]
-
-    total = len(items)
-    start = (page - 1) * page_size
-    end = start + page_size
+    if normalized_action or normalized_search:
+        items = _hydrate_prompt_file_records(records, include_previews=True)
+        if normalized_action:
+            items = [item for item in items if _matches_prompt_file_action(item, normalized_action)]
+        if normalized_search:
+            items = [item for item in items if _matches_prompt_file_search(item, normalized_search)]
+        if selected_stage == "replyer":
+            items = _deduplicate_replyer_prompt_records(items)
+        total = len(items)
+        if normalized_target_stem:
+            target_index = next((index for index, item in enumerate(items) if item.stem == normalized_target_stem), -1)
+            if target_index >= 0:
+                page = target_index // page_size + 1
+        start = (page - 1) * page_size
+        end = start + page_size
+        items = items[start:end]
+    elif selected_stage == "replyer":
+        items = _hydrate_prompt_file_records(
+            records,
+            include_previews=False,
+            include_output_preview=True,
+        )
+        items = _deduplicate_replyer_prompt_records(items)
+        total = len(items)
+        if normalized_target_stem:
+            target_index = next((index for index, item in enumerate(items) if item.stem == normalized_target_stem), -1)
+            if target_index >= 0:
+                page = target_index // page_size + 1
+        start = (page - 1) * page_size
+        end = start + page_size
+        items = items[start:end]
+    else:
+        total = len(records)
+        if normalized_target_stem:
+            target_index = next(
+                (
+                    index
+                    for index, record in enumerate(records)
+                    if str(record.get("stem") or "") == normalized_target_stem
+                ),
+                -1,
+            )
+            if target_index >= 0:
+                page = target_index // page_size + 1
+        start = (page - 1) * page_size
+        end = start + page_size
+        items = _hydrate_prompt_file_records(
+            records[start:end],
+            include_previews=False,
+            include_action_preview=True,
+            include_output_preview=True,
+        )
 
     return ReasoningPromptListResponse(
-        items=items[start:end],
+        items=items,
         total=total,
         page=page,
         page_size=page_size,
@@ -756,19 +1810,90 @@ async def list_reasoning_prompt_files(
 
 @router.get("/file", response_model=ReasoningPromptContentResponse)
 async def get_reasoning_prompt_file(path: str = Query(...)):
-    """读取推理过程 txt 日志内容。"""
+    """读取推理过程 txt/json 日志内容。"""
 
-    file_path = _resolve_prompt_log_path(path, {".txt"})
+    file_path = _resolve_prompt_log_path(path, {".txt", ".json"})
     stat = file_path.stat()
-    metadata = _extract_prompt_metadata(file_path)
+    content = file_path.read_text(encoding="utf-8", errors="replace")
+    if file_path.suffix.lower() == ".json":
+        try:
+            raw_payload = json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raw_payload = {}
+        payload = _normalize_prompt_json_payload(raw_payload) if isinstance(raw_payload, dict) else {}
+        metadata = _extract_prompt_metadata_from_json_payload(payload)
+        if isinstance(raw_payload, dict) and _is_jargon_learning_update_payload(raw_payload):
+            content = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        message_avatars = _load_prompt_message_avatar_map(path, content)
+    else:
+        metadata = _extract_prompt_metadata(file_path)
+        message_avatars = {}
 
     return ReasoningPromptContentResponse(
         path=_relative_posix_path(file_path),
-        content=file_path.read_text(encoding="utf-8", errors="replace"),
+        content=content,
         size=stat.st_size,
         modified_at=stat.st_mtime,
         model_name=metadata.get("model_name") if isinstance(metadata.get("model_name"), str) else None,
-        duration_ms=metadata.get("duration_ms") if isinstance(metadata.get("duration_ms"), float) else None,
+        duration_ms=metadata.get("duration_ms") if isinstance(metadata.get("duration_ms"), (int, float)) else None,
+        message_avatars=message_avatars,
+    )
+
+
+@router.post("/replay", response_model=ReasoningReplayResponse)
+async def replay_reasoning_prompt(request: ReasoningReplayRequest):
+    """使用可编辑消息重放一次推理过程请求。"""
+
+    model_name = _ensure_replay_model_exists(request.model_name)
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="重放消息不能为空")
+
+    tool_definitions = request.tool_definitions
+    if not tool_definitions and request.source_path:
+        source_path = _resolve_prompt_log_path(request.source_path, {".json"})
+        source_payload = _load_prompt_json(source_path)
+        raw_tool_definitions = source_payload.get("tool_definitions")
+        if isinstance(raw_tool_definitions, list):
+            tool_definitions = [item for item in raw_tool_definitions if isinstance(item, dict)]
+
+    try:
+        replay_messages = [_normalize_replay_message(message) for message in request.messages]
+    except ValueError as exc:
+        return ReasoningReplayResponse(
+            success=False,
+            model_name=model_name,
+            error=str(exc),
+        )
+
+    task_name = _resolve_replay_task_name(request.stage, model_name)
+    started_at = time.perf_counter()
+    service_result = await generate_llm_response(
+        LLMServiceRequest(
+            task_name=task_name,
+            request_type=f"webui.reasoning_replay.{request.stage or 'unknown'}",
+            prompt=replay_messages,
+            model_name=model_name,
+            tool_options=tool_definitions,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+        )
+    )
+    duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    completion = service_result.completion
+
+    return ReasoningReplayResponse(
+        success=service_result.success,
+        response=completion.response,
+        reasoning=completion.reasoning,
+        model_name=completion.model_name or model_name,
+        tool_calls=service_result.to_capability_payload().get("tool_calls") if completion.tool_calls else None,
+        prompt_tokens=completion.prompt_tokens,
+        completion_tokens=completion.completion_tokens,
+        total_tokens=completion.total_tokens,
+        prompt_cache_hit_tokens=completion.prompt_cache_hit_tokens,
+        prompt_cache_miss_tokens=completion.prompt_cache_miss_tokens,
+        duration_ms=duration_ms,
+        error=service_result.error,
     )
 
 

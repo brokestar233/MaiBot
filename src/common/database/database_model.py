@@ -2,13 +2,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from sqlalchemy import Boolean, Column, DateTime, Enum as SQLEnum, Float, Index, Integer, Text, UniqueConstraint
+from sqlalchemy import Boolean, Column, DateTime, Enum as SQLEnum, Float, Index, Integer, String, Text, UniqueConstraint
 from sqlmodel import Field, LargeBinary, SQLModel
-
-
-class ModelUser(str, Enum):
-    SYSTEM = "system"
-    PLUGIN = "plugin"
 
 
 class ImageType(str, Enum):
@@ -74,8 +69,7 @@ class ModelUsage(SQLModel, table=True):
     model_api_provider_name: str = Field(index=True, max_length=255)  # 模型API供应商名称
 
     # 请求相关信息
-    endpoint: Optional[str] = Field(default=None, max_length=255, nullable=True)  # 模型API的具体endpoint
-    user_type: ModelUser = Field(sa_column=Column(SQLEnum(ModelUser)), default=ModelUser.SYSTEM)  # 模型使用者类型
+    session_id: str = Field(default="", index=True, max_length=255)  # 对应真实聊天流；非聊天上下文为空字符串
     task_name: Optional[str] = Field(default=None, index=True, max_length=100, nullable=True)  # 模型任务配置名称
     request_type: str = Field(max_length=50)  # 内部请求类型，记录哪种模块使用了此模型
     time_cost: float = Field(sa_column=Column(Float))  # 本次请求耗时，单位秒
@@ -110,7 +104,7 @@ class Images(SQLModel, table=True):
     # 元信息
     image_hash: str = Field(index=True, max_length=255)  # 图片哈希，使用sha256哈希值，亦作为图片唯一ID
     description: str  # 图片的描述
-    full_path: str = Field(max_length=1024)  # 文件的完整路径 (包括文件名)
+    full_path: str = Field(max_length=1024)  # 项目内相对路径 (包括文件名)
     image_type: ImageType = Field(sa_column=Column(SQLEnum(ImageType)), default=ImageType.EMOJI)
     """图片类型，例如 'emoji' 或 'image'"""
 
@@ -148,8 +142,20 @@ class ToolRecord(SQLModel, table=True):
     tool_reasoning: Optional[str] = Field(default=None)  # 工具调用推理过程
     tool_data: Optional[str] = Field(default=None)  # 工具数据，JSON格式存储
 
-    tool_builtin_prompt: Optional[str] = Field(default=None)  # 内置工具提示
-    tool_display_prompt: Optional[str] = Field(default=None)  # 最终输入到 Prompt 的内容
+
+class OneTimeMaintenanceTask(SQLModel, table=True):
+    """一次性数据库维护任务状态。"""
+
+    __tablename__ = "one_time_maintenance_tasks"  # type: ignore
+
+    task_name: str = Field(primary_key=True, max_length=100)
+    phase: str = Field(max_length=50)
+    status: str = Field(max_length=50)
+    cursor_id: int = Field(default=0)
+    stats_json: str = Field(default="{}", sa_column=Column(Text, nullable=False))
+    last_error: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+    completed_at: Optional[datetime] = Field(default=None, sa_column=Column(DateTime, nullable=True))
+    updated_at: datetime = Field(default_factory=datetime.now, sa_column=Column(DateTime, index=True))
 
 
 class StatisticsAggregationCursor(SQLModel, table=True):
@@ -225,21 +231,27 @@ class StatisticsModelHourly(SQLModel, table=True):
     time_cost_sq_sum: float = Field(default=0.0)
 
 
-class CommandRecord(SQLModel, table=True):
-    """记录命令执行情况"""
+class HighFrequencyTerm(SQLModel, table=True):
+    """高频词/词组词库。"""
 
-    __tablename__ = "command_records"  # type: ignore
+    __tablename__ = "high_frequency_terms"  # type: ignore
+    __table_args__ = (
+        UniqueConstraint("chat_id", "term", name="uq_high_frequency_terms_chat_term"),
+        Index("ix_high_frequency_terms_chat_id", "chat_id"),
+        Index("ix_high_frequency_terms_chat_rank", "chat_id", "rank"),
+        Index("ix_high_frequency_terms_updated_at", "updated_at"),
+    )
 
-    id: Optional[int] = Field(default=None, primary_key=True)  # 自增主键
-
-    # 元信息
-    timestamp: datetime = Field(default_factory=datetime.now, sa_column=Column(DateTime, index=True))  # 记录时间戳
-    session_id: str = Field(index=True, max_length=255)  # 对应的 ChatSession session_id
-
-    # 调用信息
-    command_name: str = Field(index=True, max_length=255)  # 命令名称
-    command_data: Optional[str] = Field(default=None)  # 命令数据，JSON格式存储
-    command_result: Optional[str] = Field(default=None)  # 命令执行结果
+    id: Optional[int] = Field(default=None, primary_key=True)
+    chat_id: str = Field(max_length=255)
+    term: str = Field(sa_column=Column(Text, nullable=False))
+    rank: int = Field(default=0)
+    occurrence_count: int = Field(default=0)
+    message_count: int = Field(default=0)
+    frequency: float = Field(default=0.0)
+    message_frequency: float = Field(default=0.0)
+    created_at: datetime = Field(default_factory=datetime.now, sa_column=Column(DateTime, nullable=False))
+    updated_at: datetime = Field(default_factory=datetime.now, sa_column=Column(DateTime, nullable=False))
 
 
 class OnlineTime(SQLModel, table=True):
@@ -284,6 +296,116 @@ class Expression(SQLModel, table=True):
     )  # 最后修改者，标记用户或AI，为空表示暂无修改来源
 
 
+class BehaviorExperiencePath(SQLModel, table=True):
+    """可反馈的行为经验路径：场景簇 -> 行为动作 -> 结果。"""
+
+    __tablename__ = "behavior_experience_paths"  # type: ignore
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            "scene_cluster_id",
+            "action_id",
+            "outcome_id",
+            "actor_type",
+            "learning_type",
+            name="uq_behavior_experience_path_scope_cluster_action_outcome_actor",
+        ),
+        Index("ix_behavior_experience_paths_session_enabled", "session_id", "enabled"),
+        Index("ix_behavior_experience_paths_cluster", "scene_cluster_id"),
+        Index("ix_behavior_experience_paths_learning_type", "learning_type"),
+        Index("ix_behavior_experience_paths_actor_type", "actor_type"),
+        Index("ix_behavior_experience_paths_action", "action_id"),
+        Index("ix_behavior_experience_paths_outcome", "outcome_id"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: Optional[str] = Field(default=None, max_length=255, nullable=True, index=True)
+    scene_cluster_id: int = Field(index=True)
+    action_id: int = Field(index=True)
+    outcome_id: int = Field(index=True)
+    actor_type: str = Field(default="other_user", max_length=40)
+    learning_type: str = Field(default="observed_behavior", max_length=40)
+    evidence_list: str = Field(default="[]", sa_column=Column(Text, nullable=False))
+    feedback_list: str = Field(default="[]", sa_column=Column(Text, nullable=False))
+    count: int = Field(default=0)
+    activation_count: int = Field(default=0)
+    success_count: int = Field(default=0)
+    failure_count: int = Field(default=0)
+    score: float = Field(default=0.0, sa_column=Column(Float, nullable=False, server_default="0"))
+    enabled: bool = Field(default=True, sa_column=Column(Boolean, nullable=False, server_default="1"))
+
+    last_active_time: datetime = Field(default_factory=datetime.now, sa_column=Column(DateTime, index=True))
+    last_feedback_time: Optional[datetime] = Field(default=None, sa_column=Column(DateTime, nullable=True))
+    create_time: datetime = Field(default_factory=datetime.now, sa_column=Column(DateTime))
+    update_time: datetime = Field(default_factory=datetime.now, sa_column=Column(DateTime, index=True))
+
+
+class BehaviorSceneCluster(SQLModel, table=True):
+    """行为场景簇，用 tag 概率分布描述一类可触发行为分支的场景。"""
+
+    __tablename__ = "behavior_scene_clusters"  # type: ignore
+    __table_args__ = (
+        Index("ix_behavior_scene_clusters_session_id", "session_id"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: Optional[str] = Field(default=None, max_length=255, nullable=True)
+    tag_distribution: str = Field(default="[]", sa_column=Column(Text, nullable=False))
+    source_count: int = Field(default=0)
+    update_time: datetime = Field(default_factory=datetime.now, sa_column=Column(DateTime, index=True))
+
+
+class BehaviorSceneTagCluster(SQLModel, table=True):
+    """行为场景 tag 簇成员索引，用于将同义 tag 快速归到同一个簇。"""
+
+    __tablename__ = "behavior_scene_tag_clusters"  # type: ignore
+    __table_args__ = (
+        UniqueConstraint("tag_kind", "tag", name="uq_behavior_scene_tag_cluster_kind_tag"),
+        Index("ix_behavior_scene_tag_clusters_kind_cluster", "tag_kind", "cluster_key"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    tag_kind: str = Field(max_length=40, index=True)
+    tag: str = Field(sa_column=Column(Text, nullable=False))
+    cluster_key: str = Field(sa_column=Column(Text, nullable=False))
+    source_count: int = Field(default=0)
+    update_time: datetime = Field(default_factory=datetime.now, sa_column=Column(DateTime, index=True))
+
+
+class BehaviorAction(SQLModel, table=True):
+    """行为动作文本实体，用于复用动作描述。"""
+
+    __tablename__ = "behavior_actions"  # type: ignore
+    __table_args__ = (
+        UniqueConstraint("session_id", "action_hash", name="uq_behavior_action_scope_hash"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: Optional[str] = Field(default=None, max_length=255, nullable=True, index=True)
+    action: str = Field(sa_column=Column(Text, nullable=False))
+    action_hash: str = Field(max_length=64, index=True)
+    source_count: int = Field(default=0)
+    create_time: datetime = Field(default_factory=datetime.now, sa_column=Column(DateTime))
+    update_time: datetime = Field(default_factory=datetime.now, sa_column=Column(DateTime, index=True))
+
+
+class BehaviorOutcome(SQLModel, table=True):
+    """行为结果文本实体，用于复用结果描述。"""
+
+    __tablename__ = "behavior_outcomes"  # type: ignore
+    __table_args__ = (
+        UniqueConstraint("session_id", "outcome_hash", name="uq_behavior_outcome_scope_hash"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: Optional[str] = Field(default=None, max_length=255, nullable=True, index=True)
+    outcome: str = Field(sa_column=Column(Text, nullable=False))
+    outcome_hash: str = Field(max_length=64, index=True)
+    source_count: int = Field(default=0)
+    create_time: datetime = Field(default_factory=datetime.now, sa_column=Column(DateTime))
+    update_time: datetime = Field(default_factory=datetime.now, sa_column=Column(DateTime, index=True))
+
+
 class Jargon(SQLModel, table=True):
     """存黑话的模型"""
 
@@ -292,9 +414,9 @@ class Jargon(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)  # 自增主键
 
     content: str = Field(index=True, max_length=255)  # 黑话内容
-    raw_content: Optional[str] = Field(
+    evidence_messages: Optional[str] = Field(
         default=None, sa_column=Column(Text, nullable=True)
-    )  # 原始内容，未处理的黑话内容，为List[str]
+    )  # 黑话证据消息引用，格式为[[{"platform": "...", "message_id": "..."}]]
 
     meaning: str = Field(sa_column=Column(Text, nullable=False))  # 黑话含义
     session_id_dict: str = Field(
@@ -302,38 +424,16 @@ class Jargon(SQLModel, table=True):
     )  # 会话ID列表，格式为{"session_id": session_count, ...}
 
     count: int = Field(default=0)  # 使用次数
-    is_jargon: Optional[bool] = Field(default=True)  # 是否为黑话，False表示为白话
+    is_jargon: Optional[bool] = Field(default=False)  # 是否为黑话，False表示为无黑话
     is_complete: bool = Field(default=False)  # 是否为已经完成全部推断（count > 100后不再推断）
     is_global: bool = Field(default=False)  # 是否为全局黑话（独立于session_id_dict）
     last_inference_count: int = Field(default=0)  # 上一次进行推断时的count值，用于判断是否需要重新推断
     created_by: JargonCreatedBy = Field(
         default=JargonCreatedBy.AI,
-        sa_column=Column(SQLEnum(JargonCreatedBy), nullable=False),
+        sa_column=Column(String(6), nullable=False),
     )  # 创建来源，AI 表示自动学习，MANUAL 表示手动创建
     created_timestamp: datetime = Field(default_factory=datetime.now, sa_column=Column(DateTime, index=True))
     updated_timestamp: datetime = Field(default_factory=datetime.now, sa_column=Column(DateTime, index=True))
-
-
-class ChatHistory(SQLModel, table=True):
-    """存储聊天历史记录的模型"""
-
-    __tablename__ = "chat_history"  # type: ignore
-
-    id: Optional[int] = Field(default=None, primary_key=True)  # 自增主键
-
-    # 元信息
-    session_id: str = Field(index=True, max_length=255)  # 聊天会话ID
-    start_timestamp: datetime = Field(sa_column=Column(DateTime, index=True))  # 聊天开始时间
-    end_timestamp: datetime = Field(sa_column=Column(DateTime, index=True))  # 聊天结束时间
-    query_count: int = Field(default=0)  # 被检索次数
-    query_forget_count: int = Field(default=0)  # 被遗忘检查的次数
-
-    # 历史消息内容
-    original_messages: str  # 对话原文
-    participants: str  # 参与者列表，JSON格式存储
-    theme: str  # 对话主题：这段对话的主要内容，一个简短的标题
-    keywords: str  # 关键词：这段对话的关键词，JSON格式存储
-    summary: str  # 概括：对这段话的平文本概括
 
 
 class BinaryData(SQLModel, table=True):

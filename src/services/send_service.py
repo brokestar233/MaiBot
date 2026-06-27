@@ -27,6 +27,7 @@ from src.common.data_models.message_component_data_model import (
     AtComponent,
     DictComponent,
     EmojiComponent,
+    FileComponent,
     ForwardNodeComponent,
     ImageComponent,
     MessageSequence,
@@ -339,6 +340,9 @@ def _build_message_sequence_from_custom_message(
     if normalized_type == "reply":
         return MessageSequence(components=[ReplyComponent(target_message_id=str(content))])
 
+    if normalized_type == "file" and isinstance(content, dict):
+        return MessageSequence(components=[FileComponent.from_payload(deepcopy(content))])
+
     if normalized_type == "dict" and isinstance(content, dict):
         return MessageSequence(components=[DictComponent(data=deepcopy(content))])
 
@@ -423,6 +427,9 @@ def _describe_message_sequence(message_sequence: MessageSequence) -> str:
     if isinstance(component, VoiceComponent):
         return component.format_name
 
+    if isinstance(component, FileComponent):
+        return component.format_name
+
     if isinstance(component, AtComponent):
         return component.format_name
 
@@ -460,6 +467,10 @@ def _build_processed_plain_text(message: SessionMessage) -> str:
 
         if isinstance(component, VoiceComponent):
             processed_parts.append(component.content.strip() or "[语音]")
+            continue
+
+        if isinstance(component, FileComponent):
+            processed_parts.append(component.to_plain_text())
             continue
 
         if isinstance(component, AtComponent):
@@ -747,6 +758,26 @@ async def _notify_memory_automation_on_message_sent(message: SessionMessage) -> 
         logger.warning(f"[{session_id}] 长期记忆人物事实写回注册失败: {exc}")
 
 
+def _record_sent_emoji_usage(message: SessionMessage) -> None:
+    """在消息真实发送成功后记录其中表情包的使用次数。"""
+
+    emoji_hashes = [
+        component.binary_hash.strip()
+        for component in message.raw_message.components
+        if isinstance(component, EmojiComponent) and component.binary_hash.strip()
+    ]
+    if not emoji_hashes:
+        return
+
+    try:
+        from src.emoji_system.emoji_manager import emoji_manager
+
+        for emoji_hash in emoji_hashes:
+            emoji_manager.update_emoji_usage_by_hash(emoji_hash, log_missing=False)
+    except Exception as exc:
+        logger.warning(f"[SendService] 记录表情包使用次数失败: {exc}")
+
+
 def _sync_sent_message_to_maisaka_history(
     message: SessionMessage,
     *,
@@ -877,13 +908,14 @@ async def _send_via_platform_io(
     )
 
     if delivery_batch.has_success:
+        _record_sent_emoji_usage(message)
         if storage_message:
             await _store_sent_message(message)
         await _notify_memory_automation_on_message_sent(message)
         if show_log:
             successful_driver_ids = [receipt.driver_id or "unknown" for receipt in delivery_batch.sent_receipts]
             logger.info(
-                f"[SendService] 已通过 Platform IO 将消息发往平台 '{route_key.platform}' "
+                f"已通过 Platform IO 将消息发往平台 '{route_key.platform}' "
                 f"(drivers: {', '.join(successful_driver_ids)}) "
                 f"message={_build_outbound_log_preview(message)}"
             )

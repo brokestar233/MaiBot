@@ -27,10 +27,13 @@ from typing import (
 
 import asyncio
 import inspect
+import shutil
+import stat
 
 import tomlkit
 
 from src.common.logger import get_logger
+from src.common.shutdown import is_shutdown_requested
 from src.config.config import config_manager
 from src.config.file_watcher import FileChange, FileWatcher
 from src.platform_io import DeliveryBatch, InboundMessageEnvelope, get_platform_io_manager
@@ -98,7 +101,11 @@ class PluginRuntimeManager(
         self._plugin_source_watcher_subscription_id: Optional[str] = None
         self._plugin_config_watcher_subscriptions: Dict[str, Tuple[Path, str]] = {}
         self._plugin_path_cache: Dict[str, Path] = {}
-        self._manifest_validator: ManifestValidator = ManifestValidator(validate_python_package_dependencies=False)
+        self._manifest_validator: ManifestValidator = ManifestValidator(
+            validate_python_package_dependencies=False,
+            log_errors=False,
+            log_compat_warnings=False,
+        )
         self._plugin_dependency_pipeline: PluginDependencyPipeline = PluginDependencyPipeline()
         self._blocked_plugin_reasons: Dict[str, str] = {}
         self._config_reload_callback: Callable[[Sequence[str]], Awaitable[None]] = self._handle_main_config_reload
@@ -145,7 +152,11 @@ class PluginRuntimeManager(
     @classmethod
     def _discover_plugin_dependency_map(cls, plugin_dirs: Iterable[Path]) -> Dict[str, List[str]]:
         """扫描指定插件目录集合，返回 ``plugin_id -> dependencies`` 映射。"""
-        validator = ManifestValidator(validate_python_package_dependencies=False)
+        validator = ManifestValidator(
+            validate_python_package_dependencies=False,
+            log_errors=False,
+            log_compat_warnings=False,
+        )
         return validator.build_plugin_dependency_map(plugin_dirs)
 
     @classmethod
@@ -158,7 +169,11 @@ class PluginRuntimeManager(
         Returns:
             Dict[str, str]: 需要阻止加载的插件 ID 与原因映射。
         """
-        validator = ManifestValidator(validate_python_package_dependencies=False)
+        validator = ManifestValidator(
+            validate_python_package_dependencies=False,
+            log_errors=False,
+            log_compat_warnings=False,
+        )
         provider_owners: Dict[str, List[str]] = {}
         for _plugin_path, manifest in validator.iter_plugin_manifests(plugin_dirs, require_entrypoint=True):
             for client_type in manifest.llm_provider_client_types:
@@ -363,6 +378,55 @@ class PluginRuntimeManager(
 
         self._apply_blocked_plugin_reasons_to_supervisors()
 
+    @staticmethod
+    def _is_plugin_load_residue_dir(plugin_path: Path) -> bool:
+        """判断目录是否为插件加载前可安全清理的残留目录。"""
+        if not plugin_path.exists() or not plugin_path.is_dir() or plugin_path.is_symlink():
+            return False
+        if is_reserved_plugin_directory(plugin_path):
+            return False
+
+        try:
+            entries = list(plugin_path.iterdir())
+        except OSError:
+            return False
+
+        if not entries:
+            return False
+
+        allowed_names = {".git", "__pycache__"}
+        entry_names = {entry.name for entry in entries}
+        if not entry_names.issubset(allowed_names):
+            return False
+
+        return all(entry.is_dir() and not entry.is_symlink() for entry in entries)
+
+    @classmethod
+    def _cleanup_plugin_load_residue_dirs(cls, plugin_dirs: Sequence[Path]) -> List[Path]:
+        """清理插件系统加载前可判定的卸载残留目录。"""
+        removed_paths: List[Path] = []
+
+        def remove_readonly(func: Any, target_path: str, _: Any) -> None:
+            Path(target_path).chmod(stat.S_IWRITE)
+            func(target_path)
+
+        for plugin_root in plugin_dirs:
+            if not plugin_root.is_dir():
+                continue
+            for plugin_path in plugin_root.iterdir():
+                if not cls._is_plugin_load_residue_dir(plugin_path):
+                    continue
+                try:
+                    shutil.rmtree(plugin_path, onerror=remove_readonly)
+                    removed_paths.append(plugin_path)
+                except Exception as exc:
+                    logger.warning(f"清理插件加载残留目录失败: {plugin_path}: {exc}")
+
+        if removed_paths:
+            cleaned_names = ", ".join(path.name for path in removed_paths)
+            logger.info(f"插件系统加载前已清理 {len(removed_paths)} 个残留目录: {cleaned_names}")
+        return removed_paths
+
     async def _start_supervisors(
         self,
         builtin_dirs: Sequence[Path],
@@ -460,6 +524,7 @@ class PluginRuntimeManager(
         """
 
         builtin_dirs, third_party_dirs = self._resolve_runtime_plugin_dirs()
+        self._cleanup_plugin_load_residue_dirs(third_party_dirs)
         if duplicate_plugin_ids := self._find_duplicate_plugin_ids(builtin_dirs + third_party_dirs):
             details = "; ".join(
                 f"{plugin_id}: {', '.join(str(path) for path in paths)}"
@@ -497,6 +562,7 @@ class PluginRuntimeManager(
             return
 
         builtin_dirs, third_party_dirs = self._resolve_runtime_plugin_dirs()
+        self._cleanup_plugin_load_residue_dirs(third_party_dirs)
 
         if duplicate_plugin_ids := self._find_duplicate_plugin_ids(builtin_dirs + third_party_dirs):
             details = "; ".join(
@@ -556,6 +622,8 @@ class PluginRuntimeManager(
         if self._config_reload_callback_registered:
             config_manager.unregister_reload_callback(self._config_reload_callback)
             self._config_reload_callback_registered = False
+        if is_shutdown_requested():
+            await self._hook_dispatcher.stop()
 
         coroutines: List[Coroutine[Any, Any, None]] = []
         if self._builtin_supervisor:
@@ -709,6 +777,19 @@ class PluginRuntimeManager(
         for supervisor in self.supervisors:
             statuses.update(supervisor.get_plugin_load_statuses())
         return statuses
+
+    def get_plugin_circuit_statuses(self) -> Dict[str, Dict[str, Any]]:
+        """返回当前插件熔断状态。"""
+
+        from src.plugin_runtime.host.circuit_breaker import get_plugin_circuit_breaker
+
+        return get_plugin_circuit_breaker().get_plugin_statuses()
+
+    @property
+    def is_loading(self) -> bool:
+        """返回插件运行时是否仍有 Supervisor 处于加载阶段。"""
+
+        return any(bool(getattr(supervisor, "is_loading", False)) for supervisor in self.supervisors)
 
     def _build_external_available_plugins_for_supervisor(self, target_supervisor: "PluginSupervisor") -> Dict[str, str]:
         """收集某个 Supervisor 可用的外部插件版本映射。"""
@@ -1216,7 +1297,11 @@ class PluginRuntimeManager(
     def _find_duplicate_plugin_ids(cls, plugin_dirs: List[Path]) -> Dict[str, List[Path]]:
         """扫描插件目录，找出被多个目录重复声明的插件 ID。"""
         plugin_locations: Dict[str, List[Path]] = {}
-        validator = ManifestValidator(validate_python_package_dependencies=False)
+        validator = ManifestValidator(
+            validate_python_package_dependencies=False,
+            log_errors=False,
+            log_compat_warnings=False,
+        )
         for plugin_path, manifest in validator.iter_plugin_manifests(plugin_dirs):
             plugin_locations.setdefault(manifest.id, []).append(plugin_path)
 

@@ -7,22 +7,23 @@
 4. 请求-响应关联与超时管理
 """
 
-from typing import Any, Callable, Dict, List, Optional, Tuple, Coroutine
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
 import asyncio
 import contextlib
 import re
 import secrets
+import time
 
 from src.common.logger import get_logger
+from src.plugin_runtime import detect_host_application_version
 from src.plugin_runtime.protocol.codec import Codec, MsgPackCodec
 from src.plugin_runtime.protocol.envelope import (
-    PROTOCOL_VERSION,
-    MIN_SDK_VERSION,
-    MAX_SDK_VERSION,
     Envelope,
     HelloPayload,
     HelloResponsePayload,
+    MAX_SDK_VERSION,
+    MIN_SDK_VERSION,
     MessageType,
     RequestIdGenerator,
 )
@@ -47,11 +48,13 @@ class RPCServer:
         session_token: Optional[str] = None,
         codec: Optional[Codec] = None,
         send_queue_size: int = 128,
+        host_version: str = "",
     ):
         self._transport = transport
         self._session_token = session_token or secrets.token_hex(32)
         self._codec = codec or MsgPackCodec()
         self._send_queue_size = send_queue_size
+        self._host_version = host_version or detect_host_application_version()
 
         self._id_gen = RequestIdGenerator()
         self._connection: Optional[Connection] = None  # 当前活跃的 Runner 连接
@@ -61,6 +64,7 @@ class RPCServer:
 
         # 等待响应的 pending 请求: request_id -> Future
         self._pending_requests: Dict[int, asyncio.Future[Envelope]] = {}
+        self._pending_request_metadata: Dict[int, Dict[str, Any]] = {}
 
         # 发送队列（背压控制）
         self._send_queue: Optional[asyncio.Queue[Tuple[Connection, bytes, asyncio.Future[None]]]] = None
@@ -93,6 +97,42 @@ class RPCServer:
         """注册 RPC 方法处理器"""
         self._method_handlers[method] = handler
 
+    @staticmethod
+    def _summarize_payload(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """提取请求 payload 摘要，避免诊断记录写入完整消息内容。"""
+
+        if not isinstance(payload, dict):
+            return {}
+
+        summary: Dict[str, Any] = {"payload_keys": sorted(str(key) for key in payload.keys())}
+        if component_name := str(payload.get("component_name") or "").strip():
+            summary["component_name"] = component_name
+        args = payload.get("args")
+        if isinstance(args, dict):
+            summary["args_keys"] = sorted(str(key) for key in args.keys())
+            summary["args_count"] = len(args)
+        if client_type := str(payload.get("client_type") or "").strip():
+            summary["client_type"] = client_type
+        if operation := str(payload.get("operation") or "").strip():
+            summary["operation"] = operation
+        return summary
+
+    def get_pending_request_snapshot(self, min_duration_ms: int = 0) -> List[Dict[str, Any]]:
+        """返回 Host 当前等待 Runner 响应的请求快照。"""
+
+        now_monotonic = time.monotonic()
+        snapshot: List[Dict[str, Any]] = []
+        for metadata in self._pending_request_metadata.values():
+            duration_ms = int((now_monotonic - float(metadata.get("started_at_monotonic", now_monotonic))) * 1000)
+            if duration_ms < min_duration_ms:
+                continue
+            item = dict(metadata)
+            item.pop("started_at_monotonic", None)
+            item["duration_ms"] = duration_ms
+            snapshot.append(item)
+        snapshot.sort(key=lambda item: int(item.get("duration_ms", 0)), reverse=True)
+        return snapshot
+
     async def start(self) -> None:
         """启动 RPC 服务器"""
         self._running = True
@@ -106,8 +146,7 @@ class RPCServer:
         """停止 RPC 服务器"""
         self._running = False
         self.clear_handshake_state()
-        self._fail_pending_requests(ErrorCode.E_SHUTTING_DOWN, "服务器正在关闭")
-        self._fail_queued_sends(ErrorCode.E_SHUTTING_DOWN, "服务器正在关闭")
+        self.abort_pending_requests("服务器正在关闭")
 
         if self._send_worker_task:
             self._send_worker_task.cancel()
@@ -127,6 +166,13 @@ class RPCServer:
 
         await self._transport.stop()
         logger.info("RPC Server 已停止")
+
+    def abort_pending_requests(self, message: str = "服务器正在关闭") -> int:
+        """中止所有等待 Runner 响应的请求。"""
+
+        failed_pending_count = self._fail_pending_requests(ErrorCode.E_SHUTTING_DOWN, message)
+        failed_send_count = self._fail_queued_sends(ErrorCode.E_SHUTTING_DOWN, message)
+        return failed_pending_count + failed_send_count
 
     async def send_request(
         self,
@@ -165,6 +211,15 @@ class RPCServer:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Envelope] = loop.create_future()
         self._pending_requests[request_id] = future
+        self._pending_request_metadata[request_id] = {
+            "request_id": request_id,
+            "method": method,
+            "plugin_id": plugin_id,
+            "timeout_ms": timeout_ms,
+            "started_at_epoch": time.time(),
+            "started_at_monotonic": time.monotonic(),
+            "payload_summary": self._summarize_payload(payload),
+        }
 
         try:
             # 发送请求
@@ -176,9 +231,11 @@ class RPCServer:
             return await asyncio.wait_for(future, timeout=timeout_sec)
         except asyncio.TimeoutError:
             self._pending_requests.pop(request_id, None)
+            self._pending_request_metadata.pop(request_id, None)
             raise RPCError(ErrorCode.E_TIMEOUT, f"请求 {method} 超时 ({timeout_ms}ms)") from None
         except Exception as e:
             self._pending_requests.pop(request_id, None)
+            self._pending_request_metadata.pop(request_id, None)
             if isinstance(e, RPCError):
                 raise
             raise RPCError(ErrorCode.E_UNKNOWN, str(e)) from e
@@ -296,7 +353,7 @@ class RPCServer:
 
         # 发送响应
         self.clear_handshake_state()
-        resp_payload = HelloResponsePayload(accepted=True, host_version=PROTOCOL_VERSION)
+        resp_payload = HelloResponsePayload(accepted=True, host_version=self._host_version)
         resp = envelope.make_response(payload=resp_payload.model_dump())
         await conn.send_frame(self._codec.encode_envelope(resp))
         return True
@@ -350,6 +407,7 @@ class RPCServer:
     def _handle_response(self, envelope: Envelope) -> None:
         """处理来自 Runner 的响应"""
         pending_future = self._pending_requests.pop(envelope.request_id, None)
+        self._pending_request_metadata.pop(envelope.request_id, None)
         if pending_future is None:
             return
         if not pending_future.done():
@@ -399,6 +457,7 @@ class RPCServer:
                 future.set_exception(RPCError(error_code, message))
                 aborted_request_count += 1
         self._pending_requests.clear()
+        self._pending_request_metadata.clear()
         return aborted_request_count
 
     def _fail_queued_sends(self, error_code: ErrorCode, message: str) -> int:

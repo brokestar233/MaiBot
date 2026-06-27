@@ -1,12 +1,29 @@
-import { useEffect, useState, useRef } from 'react'
+import { useRouterState } from '@tanstack/react-router'
+import { useDrag } from '@use-gesture/react'
 import { ArrowUp } from 'lucide-react'
+import { type CSSProperties, useEffect, useRef, useState } from 'react'
+
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 
+const HIDDEN_TRANSLATE_X = 128
+const DRAG_THRESHOLD = 4
+const VIEWPORT_MARGIN = 16
+
+const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max)
+
 export function BackToTop() {
+  const [dragOffsetY, setDragOffsetY] = useState(0)
+  const [dragging, setDragging] = useState(false)
   const [progress, setProgress] = useState(0)
   const [visible, setVisible] = useState(false)
+  const buttonRef = useRef<HTMLButtonElement | null>(null)
   const scrollerRef = useRef<HTMLElement | null>(null)
+  const suppressClickRef = useRef(false)
+  const locationKey = useRouterState({
+    select: (state) => state.location.pathname,
+  })
+  const prefersTouchDrag = typeof window !== 'undefined' && window.matchMedia('(pointer: coarse)').matches
 
   useEffect(() => {
     const handleScroll = (e: Event) => {
@@ -27,42 +44,141 @@ export function BackToTop() {
       }
     }
 
+    const handleNavigation = () => {
+      scrollerRef.current = null
+      setProgress(0)
+      setVisible(false)
+    }
+
     // 使用捕获阶段监听所有滚动事件，因为 scroll 事件不冒泡
     window.addEventListener('scroll', handleScroll, { capture: true, passive: true })
-    return () => window.removeEventListener('scroll', handleScroll, { capture: true })
+    window.addEventListener('popstate', handleNavigation)
+    window.addEventListener('hashchange', handleNavigation)
+    return () => {
+      window.removeEventListener('scroll', handleScroll, { capture: true })
+      window.removeEventListener('popstate', handleNavigation)
+      window.removeEventListener('hashchange', handleNavigation)
+    }
   }, [])
+
+  useEffect(() => {
+    scrollerRef.current = null
+    const frameId = window.requestAnimationFrame(() => {
+      setProgress(0)
+      setVisible(false)
+    })
+
+    return () => window.cancelAnimationFrame(frameId)
+  }, [locationKey])
 
   const scrollToTop = () => {
     scrollerRef.current?.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
+  const bindDrag = useDrag(
+    ({ down, first, last, offset: [, nextOffsetY], tap, memo }) => {
+      let nextBounds = memo
+
+      if (first) {
+        const rect = buttonRef.current?.getBoundingClientRect()
+        // 拖拽始终基于当前可见位置计算边界，避免多次拖拽后累计误差。
+        nextBounds = rect
+          ? {
+              minOffsetY: dragOffsetY + VIEWPORT_MARGIN - rect.top,
+              maxOffsetY: dragOffsetY + window.innerHeight - VIEWPORT_MARGIN - rect.bottom,
+            }
+          : {
+              minOffsetY: Number.NEGATIVE_INFINITY,
+              maxOffsetY: Number.POSITIVE_INFINITY,
+            }
+        suppressClickRef.current = false
+      }
+
+      setDragging(down)
+
+      // tap 仍然保留点击语义，只有真正发生位移时才更新 translateY。
+      if (!tap && nextBounds) {
+        setDragOffsetY(clamp(nextOffsetY, nextBounds.minOffsetY, nextBounds.maxOffsetY))
+      }
+
+      if (last) {
+        setDragging(false)
+        suppressClickRef.current = !tap
+      }
+
+      return nextBounds
+    },
+    {
+      axis: 'y',
+      eventOptions: { passive: false },
+      filterTaps: true,
+      from: () => [0, dragOffsetY],
+      pointer: {
+        buttons: prefersTouchDrag ? -1 : 1,
+        keys: false,
+        touch: prefersTouchDrag,
+      },
+      preventDefault: true,
+      threshold: [0, 0],
+      tapsThreshold: DRAG_THRESHOLD,
+    }
+  )
+
+  const handleClick = (event: React.MouseEvent<HTMLButtonElement>) => {
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false
+      event.preventDefault()
+      event.stopPropagation()
+      return
+    }
+    scrollToTop()
   }
 
   // SVG 环形进度条参数
   const radius = 18
   const circumference = 2 * Math.PI * radius
   const strokeDashoffset = circumference - (progress / 100) * circumference
+  const squareProgress = Math.max(0, Math.min(101, progress >= 99.5 ? 101 : progress))
+  const squareProgressStyle = {
+    '--back-to-top-progress': `${squareProgress}%`,
+  } as CSSProperties
+  const transformX = visible ? 0 : HIDDEN_TRANSLATE_X
+  const wrapperStyle = {
+    transform: `translate3d(${transformX}px, ${dragOffsetY}px, 0px)`,
+  } as CSSProperties
 
   return (
     <div 
       className={cn(
-        "fixed bottom-24 right-8 z-50 transition-all duration-500 ease-in-out transform",
-        visible ? "translate-x-0 opacity-100" : "translate-x-32 opacity-0 pointer-events-none"
+        "fixed right-6 bottom-24 z-50 transition-[transform,opacity] ease-in-out",
+        dragging ? "duration-75" : "duration-500",
+        visible ? "opacity-100" : "pointer-events-none opacity-0"
       )}
+      style={wrapperStyle}
     >
       <Button
+        {...bindDrag()}
+        ref={buttonRef}
         variant="outline"
         size="icon"
+        data-dashboard-back-to-top="true"
         className={cn(
-          "relative h-12 w-12 rounded-full shadow-xl",
+          "relative h-10 w-10 rounded-full shadow-xl",
           "bg-background/80 backdrop-blur-md border-border/50",
-          "hover:bg-accent hover:scale-110 hover:shadow-2xl hover:border-primary/50",
-          "transition-all duration-300",
+          "hover:bg-accent hover:scale-105 hover:shadow-2xl hover:border-primary/50",
+          "touch-none transition-all duration-300",
+          dragging ? "cursor-grabbing" : "cursor-grab",
           "group"
         )}
-        onClick={scrollToTop}
+        onClick={handleClick}
         aria-label="回到顶部"
       >
         {/* 进度环背景 */}
-        <svg className="absolute inset-0 h-full w-full -rotate-90 transform p-1" viewBox="0 0 44 44">
+        <svg
+          data-dashboard-back-to-top-progress="circle"
+          className="absolute inset-0 h-full! w-full! -rotate-90 transform p-1"
+          viewBox="0 0 44 44"
+        >
           <circle
             className="text-muted-foreground/10"
             strokeWidth="3"
@@ -86,15 +202,24 @@ export function BackToTop() {
             cy="22"
           />
         </svg>
+
+        <div
+          data-dashboard-back-to-top-progress="square"
+          className="pointer-events-none absolute inset-0 hidden"
+          style={squareProgressStyle}
+        />
         
         {/* 图标 */}
         <ArrowUp 
-          className="h-5 w-5 text-primary transition-transform duration-300 group-hover:-translate-y-1 group-hover:scale-110" 
+          className="h-4 w-4 text-primary transition-transform duration-300 group-hover:-translate-y-0.5 group-hover:scale-110" 
           strokeWidth={2.5}
         />
         
         {/* 内部发光效果 (仅在 dark 模式下明显) */}
-        <div className="absolute inset-0 rounded-full bg-primary/5 opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
+        <div
+          data-dashboard-back-to-top-glow="true"
+          className="absolute inset-0 rounded-full bg-primary/5 opacity-0 group-hover:opacity-100 transition-opacity duration-300"
+        />
       </Button>
     </div>
   )

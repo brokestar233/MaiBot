@@ -18,6 +18,7 @@ from src.common.data_models.message_component_data_model import (
     AtComponent,
     DictComponent,
     EmojiComponent,
+    FileComponent,
     ForwardNodeComponent,
     ImageComponent,
     MessageSequence,
@@ -28,6 +29,7 @@ from src.common.data_models.message_component_data_model import (
     VoiceComponent,
 )
 from src.common.logger import get_logger
+from src.common.utils.image_path import resolve_stored_image_path, serialize_stored_image_path
 from src.config.config import global_config
 
 from .math_utils import number_to_short_id, TimestampMode, translate_timestamp_to_human_readable
@@ -70,7 +72,7 @@ class MessageUtils:
         if raw_msg_seq.type == "seglist":
             assert isinstance(raw_msg_seq.data, list), "seglist类型的message_segment数据应该是一个列表"
             components.extend(MessageUtils._parse_maim_message_segment_to_component(item) for item in raw_msg_seq.data)
-        elif raw_msg_seq.type in {"text", "image", "emoji", "voice", "at", "reply", "dict"}:
+        elif raw_msg_seq.type in {"text", "image", "emoji", "voice", "file", "at", "reply", "dict"}:
             components.append(MessageUtils._parse_maim_message_segment_to_component(raw_msg_seq))
         else:
             raise NotImplementedError(f"暂时不支持的消息片段类型: {raw_msg_seq.type}")
@@ -108,6 +110,9 @@ class MessageUtils:
             voice_bytes = base64.b64decode(seg.data)
             binary_hash = hashlib.md5(voice_bytes).hexdigest()
             return VoiceComponent(binary_hash=binary_hash, binary_data=voice_bytes)
+        elif seg.type == "file":
+            assert isinstance(seg.data, dict), "file类型的seg数据应该是字典"
+            return FileComponent.from_payload(seg.data)
         elif seg.type == "at":
             return MessageUtils._parse_at_segment_data(seg.data)
         elif seg.type == "reply":
@@ -115,6 +120,10 @@ class MessageUtils:
             return ReplyComponent(target_message_id=seg.data)
         elif seg.type == "dict":
             assert isinstance(seg.data, dict), "dict类型的seg数据应该是字典"
+            if str(seg.data.get("type") or "").strip().lower() == "file":
+                raw_payload = seg.data.get("data", seg.data)
+                if isinstance(raw_payload, dict):
+                    return FileComponent.from_payload(raw_payload)
             return DictComponent(data=seg.data)
         else:
             raise NotImplementedError(f"暂时不支持的消息片段类型: {seg.type}")
@@ -274,7 +283,7 @@ class MessageUtils:
 
         statement = select(images_model).filter_by(image_hash=image_hash, image_type=image_type_model.IMAGE).limit(1)
         existing_record = session.exec(statement).first()
-        if existing_record is not None and Path(existing_record.full_path).is_file():
+        if existing_record is not None and resolve_stored_image_path(existing_record.full_path).is_file():
             existing_record.no_file_flag = False
             existing_record.last_used_time = datetime.now()
             session.add(existing_record)
@@ -289,7 +298,7 @@ class MessageUtils:
 
         if existing_record is not None:
             existing_record.description = component.content.strip()
-            existing_record.full_path = str(image_path.absolute().resolve())
+            existing_record.full_path = serialize_stored_image_path(image_path)
             existing_record.no_file_flag = False
             existing_record.last_used_time = datetime.now()
             existing_record.vlm_processed = bool(component.content.strip())
@@ -299,7 +308,7 @@ class MessageUtils:
                 images_model(
                     image_hash=image_hash,
                     description=component.content.strip(),
-                    full_path=str(image_path.absolute().resolve()),
+                    full_path=serialize_stored_image_path(image_path),
                     image_type=image_type_model.IMAGE,
                     last_used_time=datetime.now(),
                     vlm_processed=bool(component.content.strip()),
@@ -845,9 +854,8 @@ class MessageUtils:
         # 构建动作文本列表
         action_messages: List[Tuple[float, str]] = []
         for action in actions:
-            if action_display_prompt := action.tool_display_prompt or "":
-                action_time = action.timestamp.timestamp()
-                action_messages.append((action_time, action_display_prompt))
+            action_time = action.timestamp.timestamp()
+            action_messages.append((action_time, f"调用了工具 {action.tool_name}"))
 
         return action_messages
 

@@ -150,12 +150,10 @@ def is_mentioned_bot_in_message(message: SessionMessage) -> tuple[bool, bool, fl
     if isinstance(add_cfg, dict):
         if add_cfg.get("at_bot") or add_cfg.get("is_mentioned"):
             is_mentioned = True
-            # 当提供数值型 is_mentioned 时，当作概率提升
-            try:
-                if add_cfg.get("is_mentioned") not in (None, ""):
-                    reply_probability = float(add_cfg.get("is_mentioned"))  # type: ignore
-            except Exception:
-                pass
+            # 当提供数值型 is_mentioned 时，当作概率提升；布尔提及标记只负责标记命中。
+            raw_mention_boost = add_cfg.get("is_mentioned")
+            if raw_mention_boost not in (None, "") and not isinstance(raw_mention_boost, bool):
+                reply_probability = float(raw_mention_boost)
 
     # 2) 已经在上游设置过的 message.is_mentioned
     if getattr(message, "is_mentioned", False):
@@ -221,10 +219,11 @@ def is_mentioned_bot_in_message(message: SessionMessage) -> tuple[bool, bool, fl
                 break
 
     # 7) 概率设置
-    if is_at and getattr(global_config.chat, "inevitable_at_reply", 1):
+    reply_timing_config = global_config.chat.reply_timing
+    if is_at and reply_timing_config.inevitable_at_reply:
         reply_probability = 1.0
         logger.debug("被@，回复概率设置为100%")
-    elif is_mentioned and getattr(global_config.chat, "mentioned_bot_reply", 1):
+    elif is_mentioned and reply_timing_config.mentioned_bot_reply:
         reply_probability = max(reply_probability, 1.0)
         logger.debug("被提及，回复概率设置为100%")
 
@@ -434,6 +433,25 @@ def split_into_sentences_w_remove_punctuation(text: str) -> list[str]:
     return final_sentences
 
 
+def merge_sentences_to_max_count(sentences: list[str], max_count: int) -> list[str]:
+    """按顺序将分句合并到指定条数以内。"""
+
+    if len(sentences) <= max_count:
+        return sentences
+
+    merged_sentences: list[str] = []
+    sentence_count = len(sentences)
+    start_index = 0
+    for group_index in range(max_count):
+        remaining_sentences = sentence_count - start_index
+        remaining_groups = max_count - group_index
+        group_size = (remaining_sentences + remaining_groups - 1) // remaining_groups
+        merged_sentences.append("".join(sentences[start_index : start_index + group_size]))
+        start_index += group_size
+
+    return merged_sentences
+
+
 def random_remove_punctuation(text: str) -> str:
     """随机处理标点符号，模拟人类打字习惯
 
@@ -500,6 +518,7 @@ def process_llm_response(text: str, enable_splitter: bool = True, enable_chinese
     # 对清理后的文本进行进一步处理
     max_length = global_config.response_splitter.max_length * 2
     max_sentence_num = global_config.response_splitter.max_sentence_num
+    max_split_num = global_config.response_splitter.max_split_num
     # 如果基本上是中文，则进行长度过滤
     if get_western_ratio(cleaned_text) < 0.1 and len(cleaned_text) > max_length:
         logger.warning(f"回复过长 ({len(cleaned_text)} 字符)，返回默认回复")
@@ -541,6 +560,8 @@ def process_llm_response(text: str, enable_splitter: bool = True, enable_chinese
         else:
             logger.warning(f"分割后消息数量过多 ({len(sentences)} 条)，返回默认回复")
             return [_get_random_default_reply()]
+
+    sentences = merge_sentences_to_max_count(sentences, max_split_num)
 
     # if extracted_contents:
     #     for content in extracted_contents:
@@ -588,7 +609,7 @@ def calculate_typing_time(
     if is_emoji:
         total_time = 1
 
-    typing_speed = global_config.chat.typing_speed
+    typing_speed = global_config.response_post_process.typing_speed
     if typing_speed <= 0:
         return 0
     total_time *= typing_speed

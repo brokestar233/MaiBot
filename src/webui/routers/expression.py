@@ -15,6 +15,7 @@ from sqlalchemy import case, func
 from sqlmodel import col, delete, select
 
 from src.chat.message_receive.chat_manager import chat_manager as _chat_manager
+from src.chat.replyer.expression_vector_index import normalize_text, resolve_project_path
 from src.common.database.database import get_db_session
 from src.common.database.database_model import ChatSession, Expression, Messages, ModifiedBy
 from src.common.logger import get_logger
@@ -29,10 +30,13 @@ from src.webui.dependencies import require_auth
 
 logger = get_logger("webui.expression")
 EXCLUDE_IDS_QUERY = Query(None, description="需要排除的表达方式 ID")
+EXPRESSION_CHAT_IDS_QUERY = Query(None, description="multiple chat ids")
+LEGACY_EXPRESSION_IMPORT_FILE = File(...)
 
 # 创建路由器
 router = APIRouter(prefix="/expression", tags=["Expression"], dependencies=[Depends(require_auth)])
 LEGACY_IMPORT_UPLOAD_DIR = Path("data/webui_legacy_expression_imports")
+LOGGED_INVALID_EXPRESSION_SESSION_IDS: set[int] = set()
 
 
 def get_configured_platform_accounts() -> set[tuple[str, str]]:
@@ -82,10 +86,60 @@ def select_legacy_import_matched_sessions(
     return [session for session in sessions if not str(session.account_id or "").strip()]
 
 
+def decode_expression_session_id(expression_id: int, raw_session_id: Any) -> Optional[str]:
+    """严格解码表达方式归属聊天流 ID，定位数据库中的坏编码记录。"""
+
+    if raw_session_id is None:
+        return None
+    if isinstance(raw_session_id, memoryview):
+        raw_session_id = raw_session_id.tobytes()
+    if isinstance(raw_session_id, bytes):
+        try:
+            session_id = raw_session_id.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            if expression_id not in LOGGED_INVALID_EXPRESSION_SESSION_IDS:
+                LOGGED_INVALID_EXPRESSION_SESSION_IDS.add(expression_id)
+                logger.error(
+                    "表达方式记录 session_id 非 UTF-8，已从 WebUI 表达列表排除: "
+                    f"id={expression_id}, session_id_hex={raw_session_id.hex().upper()}, error={exc}"
+                )
+            return None
+    elif isinstance(raw_session_id, str):
+        session_id = raw_session_id
+    else:
+        raise TypeError(f"表达方式记录 session_id 类型异常: id={expression_id}, type={type(raw_session_id)!r}")
+
+    return session_id or None
+
+
+def get_expression_session_ids(db_session: Any) -> set[str]:
+    """读取表达方式中可安全展示的聊天流 ID。"""
+
+    rows = db_session.connection().exec_driver_sql(
+        "SELECT id, CAST(session_id AS BLOB) FROM expressions WHERE session_id IS NOT NULL"
+    )
+    chat_ids: set[str] = set()
+    for expression_id, raw_session_id in rows:
+        session_id = decode_expression_session_id(expression_id, raw_session_id)
+        if session_id:
+            chat_ids.add(session_id)
+    return chat_ids
+
+
+def apply_valid_expression_session_scope(statement: Any, valid_chat_ids: set[str]) -> Any:
+    """限制表达方式查询只返回全局记录或 session_id 可正常解码的记录。"""
+
+    if valid_chat_ids:
+        return statement.where(
+            (col(Expression.session_id).is_(None)) | (col(Expression.session_id).in_(valid_chat_ids))
+        )
+    return statement.where(col(Expression.session_id).is_(None))
+
+
 def get_visible_expression_chat_ids(db_session: Any, include_legacy: bool) -> set[str]:
     """返回表达方式页面默认可见的聊天流 ID。"""
 
-    chat_ids = {chat_id for chat_id in db_session.exec(select(Expression.session_id).distinct()).all() if chat_id}
+    chat_ids = get_expression_session_ids(db_session)
     if include_legacy:
         return chat_ids
 
@@ -144,6 +198,12 @@ class ExpressionUpdateRequest(BaseModel):
     situation: Optional[str] = None
     style: Optional[str] = None
     chat_id: Optional[str] = None
+
+
+class ExpressionReviewStatusRequest(BaseModel):
+    """表达方式列表行审核状态切换请求。"""
+
+    approved: bool
 
 
 class ExpressionUpdateResponse(BaseModel):
@@ -590,6 +650,18 @@ def normalize_legacy_content_list(raw_value: Any) -> str:
     return normalize_list([raw_value])
 
 
+def apply_expression_list_review_filter(statement: Any, review_filter: str) -> Any:
+    """为表达方式列表应用人工审核状态筛选。"""
+
+    if review_filter == "all":
+        return statement
+    if review_filter == "user_checked":
+        return statement.where(col(Expression.checked).is_(True), col(Expression.modified_by) == ModifiedBy.USER)
+    if review_filter == "unchecked":
+        return statement.where(col(Expression.checked).is_(False))
+    raise HTTPException(status_code=400, detail=f"不支持的表达方式筛选: {review_filter}")
+
+
 def connect_legacy_sqlite(db_path: str) -> sqlite3.Connection:
     """以只读方式连接旧版 SQLite 数据库。"""
 
@@ -860,6 +932,50 @@ class ExpressionGroupListResponse(BaseModel):
     data: List[ExpressionGroupInfo]
 
 
+class ExpressionClusterMemberResponse(BaseModel):
+    """表达聚类成员。"""
+
+    id: int
+    situation: str
+    style: str
+    count: int = 0
+    chat_id: Optional[str] = None
+    chat_name: Optional[str] = None
+    checked: bool = False
+    modified_by: Optional[str] = None
+
+
+class ExpressionClusterSummaryResponse(BaseModel):
+    """表达聚类摘要。"""
+
+    embedding_profile_marker: str
+    cluster_id: int
+    size: int
+    members: List[ExpressionClusterMemberResponse] = Field(default_factory=list)
+
+
+class ExpressionClusterListResponse(BaseModel):
+    """表达聚类列表响应。"""
+
+    success: bool = True
+    index_exists: bool
+    index_path: str
+    generated_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    embedding_model: Optional[str] = None
+    embedding_dimension: Optional[int] = None
+    sample_count: int = 0
+    clusters: List[ExpressionClusterSummaryResponse] = Field(default_factory=list)
+
+
+class ExpressionClusterMemberListResponse(BaseModel):
+    """表达聚类成员列表响应。"""
+
+    success: bool = True
+    cluster: Optional[ExpressionClusterSummaryResponse] = None
+    data: List[ExpressionClusterMemberResponse] = Field(default_factory=list)
+
+
 @router.get("/chats", response_model=ChatListResponse)
 async def get_chat_list(
     include_legacy: bool = Query(False, description="是否显示旧格式/非当前账号的表达方式聊天流"),
@@ -944,8 +1060,7 @@ async def get_expression_groups(
                         continue
                     if is_global_expression_group_marker(platform, item_id):
                         is_global = True
-                        continue
-                    chat_ids.update(ChatConfigUtils.get_target_session_ids(target_item))
+                    chat_ids.update(ChatConfigUtils.get_target_session_ids_with_wildcards(target_item))
 
                 if not expression_group.targets:
                     is_global = True
@@ -971,13 +1086,154 @@ async def get_expression_groups(
         raise HTTPException(status_code=500, detail=f"获取表达互通组失败: {str(e)}") from e
 
 
+def read_expression_vector_index_payload() -> tuple[Path, Optional[dict[str, Any]]]:
+    """读取当前表达向量索引 JSON。"""
+
+    index_path = resolve_project_path(global_config.expression.expression_vector_index_path)
+    if not index_path.exists():
+        return index_path, None
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"表达向量索引格式异常: {index_path}")
+    return index_path, payload
+
+
+def expression_cluster_member_to_response(raw_member: dict[str, Any]) -> ExpressionClusterMemberResponse:
+    """将索引中的表达聚类成员转换为 WebUI 响应。"""
+
+    expression_id = int(raw_member.get("id") or 0)
+    chat_id = normalize_text(raw_member.get("session_id")) or None
+    modified_by = normalize_text(raw_member.get("modified_by")).lower() or None
+    return ExpressionClusterMemberResponse(
+        id=expression_id,
+        situation=normalize_text(raw_member.get("situation")),
+        style=normalize_text(raw_member.get("style")),
+        count=int(raw_member.get("count") or 0),
+        chat_id=chat_id,
+        chat_name=get_chat_name(chat_id) if chat_id else None,
+        checked=bool(raw_member.get("checked", False)),
+        modified_by=modified_by,
+    )
+
+
+def expression_cluster_summary_to_response(raw_cluster: dict[str, Any]) -> ExpressionClusterSummaryResponse:
+    """将索引中的表达聚类摘要转换为 WebUI 响应。"""
+
+    return ExpressionClusterSummaryResponse(
+        embedding_profile_marker=normalize_text(raw_cluster.get("embedding_profile_marker")),
+        cluster_id=int(raw_cluster.get("cluster_id") or 0),
+        size=int(raw_cluster.get("size") or 0),
+        members=[
+            expression_cluster_member_to_response(raw_member)
+            for raw_member in raw_cluster.get("members") or []
+            if isinstance(raw_member, dict)
+        ],
+    )
+
+
+def get_cluster_summaries(payload: dict[str, Any]) -> List[ExpressionClusterSummaryResponse]:
+    """读取并排序表达聚类摘要。"""
+
+    clusters = [
+        expression_cluster_summary_to_response(raw_cluster)
+        for raw_cluster in payload.get("clusters") or []
+        if isinstance(raw_cluster, dict)
+    ]
+    return sorted(clusters, key=lambda item: (-item.size, item.embedding_profile_marker, item.cluster_id))
+
+
+def find_cluster_summary(
+    clusters: List[ExpressionClusterSummaryResponse],
+    *,
+    cluster_id: int,
+    profile_marker: Optional[str],
+) -> Optional[ExpressionClusterSummaryResponse]:
+    """定位指定表达聚类摘要。"""
+
+    normalized_profile_marker = normalize_text(profile_marker)
+    for cluster in clusters:
+        if cluster.cluster_id != cluster_id:
+            continue
+        if normalized_profile_marker and cluster.embedding_profile_marker != normalized_profile_marker:
+            continue
+        return cluster
+    return None
+
+
+@router.get("/clusters", response_model=ExpressionClusterListResponse)
+async def get_expression_clusters() -> ExpressionClusterListResponse:
+    """获取表达向量聚类摘要。"""
+
+    try:
+        index_path, payload = read_expression_vector_index_payload()
+        if payload is None:
+            return ExpressionClusterListResponse(index_exists=False, index_path=str(index_path))
+
+        return ExpressionClusterListResponse(
+            index_exists=True,
+            index_path=str(index_path),
+            generated_at=normalize_text(payload.get("generated_at")) or None,
+            updated_at=normalize_text(payload.get("updated_at")) or None,
+            embedding_model=normalize_text(payload.get("embedding_model")) or None,
+            embedding_dimension=int(payload.get("embedding_dimension") or 0) or None,
+            sample_count=int(payload.get("sample_count") or 0),
+            clusters=get_cluster_summaries(payload),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"获取表达聚类失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取表达聚类失败: {str(e)}") from e
+
+
+@router.get("/clusters/{cluster_id}/members", response_model=ExpressionClusterMemberListResponse)
+async def get_expression_cluster_members(
+    cluster_id: int,
+    profile_marker: Optional[str] = Query(None, description="embedding profile marker"),
+) -> ExpressionClusterMemberListResponse:
+    """获取指定表达聚类的完整成员列表。"""
+
+    try:
+        _, payload = read_expression_vector_index_payload()
+        if payload is None:
+            return ExpressionClusterMemberListResponse(cluster=None, data=[])
+
+        clusters = get_cluster_summaries(payload)
+        cluster = find_cluster_summary(clusters, cluster_id=cluster_id, profile_marker=profile_marker)
+        if cluster is None:
+            raise HTTPException(status_code=404, detail=f"未找到表达聚类: {cluster_id}")
+
+        members: List[ExpressionClusterMemberResponse] = []
+        for raw_expression in payload.get("expressions") or []:
+            if not isinstance(raw_expression, dict):
+                continue
+            if int(raw_expression.get("cluster_id") or 0) != cluster_id:
+                continue
+            raw_profile_marker = normalize_text(raw_expression.get("embedding_profile_marker"))
+            if cluster.embedding_profile_marker and raw_profile_marker != cluster.embedding_profile_marker:
+                continue
+            members.append(expression_cluster_member_to_response(raw_expression))
+        members.sort(key=lambda item: (-item.count, item.id))
+
+        return ExpressionClusterMemberListResponse(cluster=cluster, data=members)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"获取表达聚类成员失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取表达聚类成员失败: {str(e)}") from e
+
+
 @router.get("/list", response_model=ExpressionListResponse)
 async def get_expression_list(
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, ge=1, le=100, description="每页数量"),
     search: Optional[str] = Query(None, description="搜索关键词"),
     chat_id: Optional[str] = Query(None, description="聊天ID筛选"),
-    chat_ids: Optional[List[str]] = Query(None, description="multiple chat ids"),
+    chat_ids: Optional[List[str]] = EXPRESSION_CHAT_IDS_QUERY,
+    review_filter: str = Query("all", description="表达方式筛选: all/user_checked/unchecked"),
+    sort_by: str = Query("time", description="表达方式排序: time"),
     include_legacy: bool = Query(False, description="是否显示旧格式/非当前账号的表达方式"),
 ) -> ExpressionListResponse:
     """获取表达方式列表。
@@ -993,9 +1249,17 @@ async def get_expression_list(
     """
     try:
         # 构建查询
-        if not include_legacy:
-            with get_db_session() as filter_session:
+        if sort_by != "time":
+            raise HTTPException(status_code=400, detail=f"不支持的表达方式排序: {sort_by}")
+
+        visible_chat_ids: set[str] = set()
+        valid_expression_chat_ids: set[str] = set()
+        with get_db_session() as filter_session:
+            if include_legacy:
+                valid_expression_chat_ids = get_expression_session_ids(filter_session)
+            else:
                 visible_chat_ids = get_visible_expression_chat_ids(filter_session, include_legacy=False)
+        if not include_legacy:
             if chat_id:
                 if chat_id not in visible_chat_ids:
                     return ExpressionListResponse(success=True, total=0, page=page, page_size=page_size, data=[])
@@ -1021,6 +1285,10 @@ async def get_expression_list(
             statement = statement.where(col(Expression.session_id).in_(chat_ids))
         elif not include_legacy:
             statement = statement.where(col(Expression.session_id).in_(visible_chat_ids))
+        else:
+            statement = apply_valid_expression_session_scope(statement, valid_expression_chat_ids)
+
+        statement = apply_expression_list_review_filter(statement, review_filter)
 
         # 排序：最后活跃时间倒序（NULL 值放在最后）
         statement = statement.order_by(
@@ -1045,6 +1313,9 @@ async def get_expression_list(
                 count_statement = count_statement.where(col(Expression.session_id).in_(chat_ids))
             elif not include_legacy:
                 count_statement = count_statement.where(col(Expression.session_id).in_(visible_chat_ids))
+            else:
+                count_statement = apply_valid_expression_session_scope(count_statement, valid_expression_chat_ids)
+            count_statement = apply_expression_list_review_filter(count_statement, review_filter)
             total = count_expressions(session, count_statement)
             data = [expression_to_response(expr, session) for expr in expressions]
 
@@ -1204,7 +1475,7 @@ async def preview_legacy_expression_import(
 
 @router.post("/legacy-import/preview-file", response_model=LegacyExpressionImportPreviewResponse)
 async def preview_legacy_expression_import_file(
-    file: UploadFile = File(...),
+    file: UploadFile = LEGACY_EXPRESSION_IMPORT_FILE,
 ) -> LegacyExpressionImportPreviewResponse:
     """上传旧版数据库文件并预览表达方式导入分组。"""
 
@@ -1459,6 +1730,36 @@ async def update_expression(
         raise HTTPException(status_code=500, detail=f"更新表达方式失败: {str(e)}") from e
 
 
+@router.patch("/{expression_id}/review-status", response_model=ExpressionUpdateResponse)
+async def update_expression_review_status(
+    expression_id: int,
+    request: ExpressionReviewStatusRequest,
+) -> ExpressionUpdateResponse:
+    """切换表达方式的人工审核状态，不删除表达方式。"""
+
+    try:
+        with get_db_session() as session:
+            db_expression = session.exec(select(Expression).where(col(Expression.id) == expression_id).limit(1)).first()
+            if not db_expression:
+                raise HTTPException(status_code=404, detail=f"未找到 ID 为 {expression_id} 的表达方式")
+
+            db_expression.checked = request.approved
+            db_expression.modified_by = ModifiedBy.USER if request.approved else None
+            db_expression.last_active_time = datetime.now()
+            session.add(db_expression)
+            data = expression_to_response(db_expression, session)
+
+        message = "已设为人工通过" if request.approved else "已设为拒绝"
+        logger.info(f"表达方式审核状态已更新: ID={expression_id}, approved={request.approved}")
+        return ExpressionUpdateResponse(success=True, message=message, data=data)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"更新表达方式审核状态失败: {e}")
+        raise HTTPException(status_code=500, detail=f"更新表达方式审核状态失败: {str(e)}") from e
+
+
 @router.delete("/{expression_id}", response_model=ExpressionDeleteResponse)
 async def delete_expression(expression_id: int) -> ExpressionDeleteResponse:
     """删除表达方式。
@@ -1555,6 +1856,8 @@ async def get_expression_stats(
             total_statement = select(Expression.id)
             if not include_legacy:
                 total_statement = total_statement.where(col(Expression.session_id).in_(visible_chat_ids))
+            else:
+                total_statement = apply_valid_expression_session_scope(total_statement, visible_chat_ids)
             total = count_expressions(session, total_statement)
 
             chat_stats_statement = (
@@ -1562,8 +1865,7 @@ async def get_expression_stats(
                 .where(col(Expression.session_id).is_not(None))
                 .group_by(col(Expression.session_id))
             )
-            if not include_legacy:
-                chat_stats_statement = chat_stats_statement.where(col(Expression.session_id).in_(visible_chat_ids))
+            chat_stats_statement = chat_stats_statement.where(col(Expression.session_id).in_(visible_chat_ids))
             chat_stats = {chat_id: count for chat_id, count in session.exec(chat_stats_statement).all() if chat_id}
 
             seven_days_ago = datetime.now() - timedelta(days=7)
@@ -1574,6 +1876,8 @@ async def get_expression_stats(
             )
             if not include_legacy:
                 recent_statement = recent_statement.where(col(Expression.session_id).in_(visible_chat_ids))
+            else:
+                recent_statement = apply_valid_expression_session_scope(recent_statement, visible_chat_ids)
             recent = session.exec(recent_statement).one()
 
         return {

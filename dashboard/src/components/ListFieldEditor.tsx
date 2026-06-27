@@ -32,6 +32,7 @@ import { DraftNumberInput } from '@/components/ui/draft-number-input'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card } from '@/components/ui/card'
+import { MultiSelect } from '@/components/ui/multi-select'
 import { Switch } from '@/components/ui/switch'
 import { Slider } from '@/components/ui/slider'
 import {
@@ -52,6 +53,10 @@ export interface ItemFieldDefinition {
   label?: string
   placeholder?: string
   default?: unknown
+  /** select 是否允许多选 */
+  multiple?: boolean
+  /** 当字段本身仍是数组时，描述其元素类型 */
+  item_type?: string
   /** select 类型的选项 */
   choices?: unknown[]
   /** slider 类型的最小值 */
@@ -60,6 +65,12 @@ export interface ItemFieldDefinition {
   max?: number
   /** slider 类型的步进 */
   step?: number
+  /** 嵌套数组为 object 时的字段定义 */
+  item_fields?: Record<string, ItemFieldDefinition>
+  /** 嵌套数组最小项数 */
+  min_items?: number
+  /** 嵌套数组最大项数 */
+  max_items?: number
 }
 
 export interface ListFieldEditorProps {
@@ -263,27 +274,47 @@ function ObjectItemEditor({
 
     // select
     if (fieldDef.type === 'select' && fieldDef.choices) {
+      const selectedValues = Array.isArray(fieldValue)
+            ? fieldValue.map((item) => String(item))
+            : Array.isArray(fieldDef.default)
+              ? fieldDef.default.map((item) => String(item))
+              : []
+
       return (
         <div className="space-y-1">
           <Label className="text-xs text-muted-foreground">
             {fieldDef.label ?? fieldName}
           </Label>
-          <Select
-            value={String(fieldValue ?? fieldDef.default ?? '')}
-            onValueChange={(v) => handleFieldChange(fieldName, v)}
-            disabled={disabled}
-          >
-            <SelectTrigger className="h-8 text-sm">
-              <SelectValue placeholder={fieldDef.placeholder ?? '请选择'} />
-            </SelectTrigger>
-            <SelectContent>
-              {fieldDef.choices.map((choice) => (
-                <SelectItem key={String(choice)} value={String(choice)}>
-                  {String(choice)}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+         {
+            fieldDef.multiple ? 
+            <MultiSelect
+              options={fieldDef.choices.map((choice) => ({
+                label: String(choice),
+                value: String(choice),
+              }))}
+              selected={selectedValues}
+              onChange={(nextValue) => handleFieldChange(fieldName, nextValue)}
+              placeholder={fieldDef.placeholder ?? '请选择'}
+              compact
+              disabled={disabled}
+            />: 
+            <Select
+              value={String(fieldValue ?? fieldDef.default ?? '')}
+              onValueChange={(v) => handleFieldChange(fieldName, v)}
+              disabled={disabled}
+            >
+              <SelectTrigger className="h-8 text-sm">
+                <SelectValue placeholder={fieldDef.placeholder ?? '请选择'} />
+              </SelectTrigger>
+              <SelectContent>
+                {fieldDef.choices.map((choice) => (
+                  <SelectItem key={String(choice)} value={String(choice)}>
+                    {String(choice)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          }
         </div>
       )
     }
@@ -305,6 +336,33 @@ function ObjectItemEditor({
             placeholder={fieldDef.placeholder}
             disabled={disabled}
             className="h-8 text-sm"
+          />
+        </div>
+      )
+    }
+
+    // array
+    if (fieldDef.type === 'array') {
+      const selectedValues = Array.isArray(fieldValue)
+        ? fieldValue
+        : Array.isArray(fieldDef.default)
+          ? fieldDef.default
+          : []
+
+      return (
+        <div className="space-y-1">
+          <Label className="text-xs text-muted-foreground">
+            {fieldDef.label ?? fieldName}
+          </Label>
+          <ListFieldEditor
+            value={selectedValues}
+            onChange={(nextValue) => handleFieldChange(fieldName, nextValue)}
+            itemType={fieldDef.item_type ?? 'string'}
+            itemFields={fieldDef.item_fields}
+            minItems={fieldDef.min_items}
+            maxItems={fieldDef.max_items}
+            disabled={disabled}
+            placeholder={fieldDef.placeholder}
           />
         </div>
       )
@@ -381,7 +439,8 @@ export function ListFieldEditor({
       newIds.push(getItemId(i))
     }
     return newIds
-  }, [items.length, getItemId])
+    // 同长度排序也会改变每个位置对应的数据项，需要重新读取已重排的 ID 映射。
+  }, [items, getItemId])
 
   // DnD 传感器配置
   const sensors = useSensors(
@@ -402,11 +461,17 @@ export function ListFieldEditor({
       if (over && active.id !== over.id) {
         const oldIndex = sortableIds.indexOf(active.id as string)
         const newIndex = sortableIds.indexOf(over.id as string)
+        if (oldIndex === -1 || newIndex === -1) return
+
         const newItems = arrayMove(items, oldIndex, newIndex)
+        // key 必须跟随被拖拽的数据项移动，避免 React 按旧位置复用输入框等子组件状态。
+        arrayMove(sortableIds, oldIndex, newIndex).forEach((id, index) => {
+          itemIds.set(index, id)
+        })
         onChange(newItems)
       }
     },
-    [items, sortableIds, onChange]
+    [items, sortableIds, itemIds, onChange]
   )
 
   // 添加新项
@@ -443,11 +508,17 @@ export function ListFieldEditor({
     (index: number) => {
       if (minItems != null && items.length <= minItems) return
       const newItems = items.filter((_: unknown, i: number) => i !== index)
-      // 清理 itemIds 映射
-      itemIds.delete(index)
+      // 删除后后续数据项会前移，对应的 key 也要前移。
+      sortableIds
+        .filter((_: string, i: number) => i !== index)
+        .forEach((id, nextIndex) => {
+          itemIds.set(nextIndex, id)
+        })
+      // 前移后 Map 中仍会残留旧的最后一项索引，需要按新长度删除尾部 ID。
+      itemIds.delete(newItems.length)
       onChange(newItems)
     },
-    [items, minItems, itemIds, onChange]
+    [items, minItems, sortableIds, itemIds, onChange]
   )
 
   const canAdd = maxItems == null || items.length < maxItems

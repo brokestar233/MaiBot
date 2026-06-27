@@ -1,11 +1,10 @@
 /**
  * MaiBot Dashboard 版本管理
- * 
- * 这是唯一需要修改版本号的地方
- * 修改此处的版本号后，所有展示版本的地方都会自动更新
  */
 
-export const APP_VERSION = '1.3.1'
+declare const __APP_VERSION__: string
+
+export const APP_VERSION = __APP_VERSION__
 export const APP_NAME = 'MaiBot Dashboard'
 export const APP_FULL_NAME = `${APP_NAME} ${APP_VERSION}`
 

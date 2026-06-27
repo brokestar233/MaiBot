@@ -680,7 +680,7 @@ def build_session_info_message(
     Returns:
         Dict[str, Any]: 会话信息消息。
     """
-    # bot_qq 用于前端从 QQ 头像公开接口拉取机器人头像（qq_account == 0 表示未配置，不推送）。
+    # bot_qq 用于前端通过 WebUI 头像缓存接口加载机器人头像（qq_account == 0 表示未配置，不推送）。
     bot_qq_account = int(getattr(global_config.bot, "qq_account", 0) or 0)
     session_info_data: Dict[str, Any] = {
         "type": "session_info",
@@ -1065,15 +1065,12 @@ def create_message_data(
     for file in normalized_files:
         message_segments.append(
             {
-                "type": "dict",
+                "type": "file",
                 "data": {
-                    "type": "file",
-                    "data": {
-                        "name": file.get("name", ""),
-                        "mime_type": file.get("mime_type", ""),
-                        "size": file.get("size", 0),
-                        "base64": file.get("base64", ""),
-                    },
+                    "name": file.get("name", ""),
+                    "mime_type": file.get("mime_type", ""),
+                    "size": file.get("size", 0),
+                    "base64": file.get("base64", ""),
                 },
             }
         )

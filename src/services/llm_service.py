@@ -23,6 +23,7 @@ from src.common.data_models.llm_service_data_models import (
     PromptMessage,
 )
 from src.common.logger import get_logger
+from src.common.utils.utils_image import ImageUtils
 from src.llm_models.model_client.base_client import BaseClient
 from src.llm_models.payload_content.message import Message, MessageBuilder, RoleType
 from src.llm_models.payload_content.tool_option import ToolCall
@@ -59,7 +60,16 @@ class LLMServiceClient:
         self.task_name = _resolve_task_name(task_name)
         self.request_type = request_type
         self.session_id = str(session_id or "").strip()
-        self._orchestrator = LLMOrchestrator(task_name=self.task_name, request_type=request_type)
+        self._orchestrator = LLMOrchestrator(
+            task_name=self.task_name,
+            request_type=request_type,
+            session_id=self.session_id,
+        )
+
+    def _resolve_effective_session_id(self, session_id: str = "") -> str:
+        """解析本次请求用于统计归属的聊天流 ID。"""
+
+        return str(session_id or self.session_id or "").strip()
 
     @staticmethod
     def _normalize_generation_options(options: LLMGenerationOptions | None = None) -> LLMGenerationOptions:
@@ -139,14 +149,20 @@ class LLMServiceClient:
         }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
 
-    def _record_cache_stats(self, result: LLMResponseResult, prompt_text: str | None = None) -> None:
+    def _record_cache_stats(
+        self,
+        result: LLMResponseResult,
+        prompt_text: str | None = None,
+        *,
+        session_id: str = "",
+    ) -> None:
         """记录当前调用的 prompt cache 统计。"""
 
         record_llm_cache_usage(
             task_name=self.task_name,
             request_type=self.request_type,
             model_name=result.model_name,
-            session_id=self.session_id,
+            session_id=self._resolve_effective_session_id(session_id),
             prompt_tokens=result.prompt_tokens,
             prompt_cache_hit_tokens=result.prompt_cache_hit_tokens,
             prompt_cache_miss_tokens=result.prompt_cache_miss_tokens,
@@ -157,6 +173,8 @@ class LLMServiceClient:
         self,
         prompt: str,
         options: LLMGenerationOptions | None = None,
+        *,
+        session_id: str = "",
     ) -> LLMResponseResult:
         """生成单轮文本响应。
 
@@ -182,14 +200,17 @@ class LLMServiceClient:
             response_format=active_options.response_format,
             raise_when_empty=active_options.raise_when_empty,
             interrupt_flag=active_options.interrupt_flag,
+            session_id=self._resolve_effective_session_id(session_id),
         )
-        self._record_cache_stats(result, prompt_text=prompt_text)
+        self._record_cache_stats(result, prompt_text=prompt_text, session_id=session_id)
         return result
 
     async def generate_response_with_messages(
         self,
         message_factory: MessageFactory,
         options: LLMGenerationOptions | None = None,
+        *,
+        session_id: str = "",
     ) -> LLMResponseResult:
         """基于消息工厂生成响应。
 
@@ -228,8 +249,9 @@ class LLMServiceClient:
             response_format=active_options.response_format,
             raise_when_empty=active_options.raise_when_empty,
             interrupt_flag=active_options.interrupt_flag,
+            session_id=self._resolve_effective_session_id(session_id),
         )
-        self._record_cache_stats(result, prompt_text=prompt_text_holder.get("prompt_text"))
+        self._record_cache_stats(result, prompt_text=prompt_text_holder.get("prompt_text"), session_id=session_id)
         return result
 
     async def generate_response_for_image(
@@ -238,6 +260,8 @@ class LLMServiceClient:
         image_base64: str,
         image_format: str,
         options: LLMImageOptions | None = None,
+        *,
+        session_id: str = "",
     ) -> LLMResponseResult:
         """为图像内容生成响应。
 
@@ -251,6 +275,18 @@ class LLMServiceClient:
             LLMResponseResult: 统一文本生成结果。
         """
         active_options = self._normalize_image_options(options)
+        original_image_base64_size = len(image_base64)
+        image_base64, image_format, resized_for_model = ImageUtils.normalize_image_base64_for_model(
+            image_base64,
+            image_format,
+        )
+        if resized_for_model:
+            logger.info(
+                "图片尺寸低于视觉模型常见最小识别限制，已使用最近邻整数放大后再请求模型: "
+                f"request_type={self.request_type}, "
+                f"original_base64_size={original_image_base64_size}, normalized_base64_size={len(image_base64)}"
+            )
+
         image_digest = hashlib.sha256(image_base64.encode("utf-8")).hexdigest() if image_base64 else ""
         prompt_text = json.dumps(
             {
@@ -281,11 +317,12 @@ class LLMServiceClient:
             temperature=active_options.temperature,
             max_tokens=active_options.max_tokens,
             interrupt_flag=active_options.interrupt_flag,
+            session_id=self._resolve_effective_session_id(session_id),
         )
-        self._record_cache_stats(result, prompt_text=prompt_text)
+        self._record_cache_stats(result, prompt_text=prompt_text, session_id=session_id)
         return result
 
-    async def transcribe_audio(self, voice_base64: str) -> LLMAudioTranscriptionResult:
+    async def transcribe_audio(self, voice_base64: str, *, session_id: str = "") -> LLMAudioTranscriptionResult:
         """执行音频转写请求。
 
         Args:
@@ -294,9 +331,10 @@ class LLMServiceClient:
         Returns:
             LLMAudioTranscriptionResult: 音频转写结果对象。
         """
+        del session_id
         return await self._orchestrator.generate_response_for_voice(voice_base64)
 
-    async def embed_text(self, embedding_input: str) -> EmbeddingResult:
+    async def embed_text(self, embedding_input: str, *, session_id: str = "") -> EmbeddingResult:
         """兼容旧调用的文本嵌入入口。
 
         Args:
@@ -308,8 +346,9 @@ class LLMServiceClient:
         embedding_client = EmbeddingServiceClient(
             task_name=self.task_name,
             request_type=self.request_type,
+            session_id=self._resolve_effective_session_id(session_id),
         )
-        return await embedding_client.embed_text(embedding_input)
+        return await embedding_client.embed_text(embedding_input, session_id=session_id)
 
 
 def get_available_models() -> Dict[str, Any]:
@@ -612,7 +651,11 @@ async def generate(request: LLMServiceRequest) -> LLMServiceResult:
     Returns:
         LLMServiceResult: 统一响应对象；失败时 `success=False`。
     """
-    llm_client = LLMServiceClient(task_name=request.task_name, request_type=request.request_type)
+    llm_client = LLMServiceClient(
+        task_name=request.task_name,
+        request_type=request.request_type,
+        session_id=request.session_id,
+    )
     if request.message_factory is not None:
         active_message_factory = request.message_factory
     else:

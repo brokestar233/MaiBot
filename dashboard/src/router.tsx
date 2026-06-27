@@ -69,15 +69,6 @@ const botConfigRoute = createRoute({
   component: lazyRouteComponent(() => import('./routes/config/bot'), 'BotConfigPage'),
 })
 
-// 配置路由 - 旧模型厂商配置入口，已合并到模型配置页
-const modelProviderConfigRoute = createRoute({
-  getParentRoute: () => protectedRoute,
-  path: '/config/modelProvider',
-  beforeLoad: () => {
-    throw redirect({ to: '/config/model' })
-  },
-})
-
 // 配置路由 - 麦麦模型配置
 const modelConfigRoute = createRoute({
   getParentRoute: () => protectedRoute,
@@ -85,7 +76,7 @@ const modelConfigRoute = createRoute({
   component: lazyRouteComponent(() => import('./routes/config/model'), 'ModelConfigPage'),
 })
 
-// 配置路由 - 麦麦适配器配置（已停用，引导跳转到插件配置；旧实现保留在 ./routes/config/adapter）
+// 配置路由 - Prompt 管理
 const promptManagementRoute = createRoute({
   getParentRoute: () => protectedRoute,
   path: '/config/prompts',
@@ -97,12 +88,6 @@ const promptGeneratorRoute = createRoute({
   getParentRoute: () => protectedRoute,
   path: '/config/prompt-generator',
   component: lazyRouteComponent(() => import('./routes/prompt-generator'), 'PromptGeneratorPage'),
-})
-
-const adapterConfigRoute = createRoute({
-  getParentRoute: () => protectedRoute,
-  path: '/config/adapter',
-  component: lazyRouteComponent(() => import('./routes/config/adapter-disabled'), 'AdapterConfigPage'),
 })
 
 // 资源管理路由 - 表情包管理
@@ -143,6 +128,15 @@ const jargonManagementRoute = createRoute({
 })
 
 // 资源管理路由 - 知识库图谱可视化
+const behaviorLearningRoute = createRoute({
+  getParentRoute: () => protectedRoute,
+  path: '/resource/behavior',
+  component: lazyRouteComponent(
+    () => import('./routes/resource/behavior/index.tsx'),
+    'BehaviorLearningPage'
+  ),
+})
+
 const knowledgeGraphRoute = createRoute({
   getParentRoute: () => protectedRoute,
   path: '/resource/knowledge-graph',
@@ -189,18 +183,38 @@ const chatRoute = createRoute({
   component: lazyRouteComponent(() => import('./routes/chat/index'), 'ChatPage'),
 })
 
+// 聊天管理路由
+const chatManagementRoute = createRoute({
+  getParentRoute: () => protectedRoute,
+  path: '/chat-management',
+  component: lazyRouteComponent(() => import('./routes/chat-management'), 'ChatManagementPage'),
+})
+
+// 外部程序嵌入用聊天室路由，不挂载 dashboard 顶栏
+const chatEmbedRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/chat/embed',
+  component: lazyRouteComponent(() => import('./routes/chat/embed'), 'ChatEmbedPage'),
+})
+
+// 外部程序嵌入用插件市场路由，不挂载 dashboard 顶栏和侧边栏
+const pluginsEmbedRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/plugins/embed',
+  component: lazyRouteComponent(
+    () => import('./routes/plugins/embed'),
+    'PluginMarketplaceEmbedPage'
+  ),
+})
+
 // 插件市场路由
 const pluginsRoute = createRoute({
   getParentRoute: () => protectedRoute,
   path: '/plugins',
-  component: lazyRouteComponent(() => import('./routes/plugins/index'), 'PluginsPage'),
-})
-
-// 插件详情路由
-const pluginDetailRoute = createRoute({
-  getParentRoute: () => protectedRoute,
-  path: '/plugin-detail',
-  component: lazyRouteComponent(() => import('./routes/plugin-detail'), 'PluginDetailPage'),
+  component: lazyRouteComponent(
+    () => import('./routes/plugins/PluginMarketplacePage'),
+    'PluginMarketplacePage'
+  ),
 })
 
 // 模型分配预设市场路由
@@ -215,6 +229,26 @@ const pluginConfigRoute = createRoute({
   getParentRoute: () => protectedRoute,
   path: '/plugin-config',
   component: lazyRouteComponent(() => import('./routes/plugin-config'), 'PluginConfigPage'),
+})
+
+// 外部程序嵌入用插件配置路由，不挂载 dashboard 顶栏和侧边栏
+const pluginConfigEmbedRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/plugin-config/embed',
+  component: lazyRouteComponent(
+    () => import('./routes/plugin-config-embed'),
+    'PluginConfigEmbedPage'
+  ),
+})
+
+// 外部程序嵌入用插件镜像源配置路由，不挂载 dashboard 顶栏和侧边栏
+const pluginMirrorsEmbedRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/plugin-mirrors/embed',
+  component: lazyRouteComponent(
+    () => import('./routes/plugin-mirrors-embed'),
+    'PluginMirrorsEmbedPage'
+  ),
 })
 
 // 插件镜像源配置路由
@@ -282,22 +316,24 @@ const notFoundRoute = createRoute({
 const routeTree = rootRoute.addChildren([
   authRoute,
   setupRoute,
+  chatEmbedRoute,
+  pluginsEmbedRoute,
+  pluginConfigEmbedRoute,
+  pluginMirrorsEmbedRoute,
   protectedRoute.addChildren([
     indexRoute,
     botConfigRoute,
-    modelProviderConfigRoute,
     modelConfigRoute,
     promptManagementRoute,
     promptGeneratorRoute,
-    adapterConfigRoute,
     emojiManagementRoute,
     expressionManagementRoute,
     jargonManagementRoute,
+    behaviorLearningRoute,
     personManagementRoute,
     knowledgeGraphRoute,
     knowledgeBaseRoute,
     pluginsRoute,
-    pluginDetailRoute,
     modelPresetsRoute,
     pluginConfigRoute,
     pluginMirrorsRoute,
@@ -305,6 +341,7 @@ const routeTree = rootRoute.addChildren([
     logsRoute,
     reasoningProcessRoute,
     plannerMonitorRoute,
+    chatManagementRoute,
     chatRoute,
     settingsRoute,
     packMarketRoute,

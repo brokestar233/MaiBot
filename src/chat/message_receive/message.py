@@ -15,6 +15,7 @@ from src.common.data_models.message_component_data_model import (
     AtComponent,
     DictComponent,
     EmojiComponent,
+    FileComponent,
     ForwardNodeComponent,
     ImageComponent,
     ReplyComponent,
@@ -277,6 +278,8 @@ class SessionMessage(MaiMessage):
             return f"At(target={target_name!r})"
         if isinstance(component, VoiceComponent):
             return f"Voice(content={self._truncate_text(component.content or None, 60)})"
+        if isinstance(component, FileComponent):
+            return f"File(name={component.name!r}, size={component.size!r})"
         if isinstance(component, ReplyComponent):
             sender_name = (
                 component.target_message_sender_cardname
@@ -307,6 +310,7 @@ class SessionMessage(MaiMessage):
             enable_heavy_media_analysis: 是否同步执行图片与表情包描述生成。
             enable_voice_transcription: 是否同步执行语音转写。
         """
+        self._remove_voice_placeholder_text_components()
         id_content_map = MsgIDMapping()
         tasks = [
             self.process_single_component(
@@ -325,6 +329,19 @@ class SessionMessage(MaiMessage):
             else:
                 processed_texts.append(result)
         self.processed_plain_text = " ".join(processed_texts)
+
+    def _remove_voice_placeholder_text_components(self) -> None:
+        """移除适配器随语音片段附带的文本占位，避免污染处理后的文本。"""
+
+        has_voice_component = any(isinstance(component, VoiceComponent) for component in self.raw_message.components)
+        if not has_voice_component:
+            return
+
+        self.raw_message.components = [
+            component
+            for component in self.raw_message.components
+            if not (isinstance(component, TextComponent) and component.text.strip().lower() == "[voice]")
+        ]
 
     async def process_single_component(
         self,
@@ -366,6 +383,8 @@ class SessionMessage(MaiMessage):
                 component,
                 enable_voice_transcription=enable_voice_transcription,
             )
+        elif isinstance(component, FileComponent):
+            return component.to_plain_text()
         elif isinstance(component, ReplyComponent):
             return await self.process_reply_component(component, id_content_map)
         elif isinstance(component, ForwardNodeComponent):
@@ -485,6 +504,7 @@ class SessionMessage(MaiMessage):
         try:
             tuple_content = await emoji_manager.get_emoji_description(
                 emoji_bytes=component.binary_data,
+                session_id=self.session_id,
                 wait_for_build=enable_heavy_media_analysis,
             )
         except Exception:

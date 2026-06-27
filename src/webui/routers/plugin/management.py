@@ -2,9 +2,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Cookie, HTTPException
 import json
 import shutil
+
+from fastapi import APIRouter, Cookie, HTTPException
 import tomlkit
 
 from src.common.logger import get_logger
@@ -102,6 +103,26 @@ def _get_runtime_plugin_load_statuses() -> Dict[str, str]:
         return {}
 
 
+def _get_runtime_plugin_circuit_statuses() -> Dict[str, Dict[str, Any]]:
+    try:
+        from src.plugin_runtime.integration import get_plugin_runtime_manager
+
+        return get_plugin_runtime_manager().get_plugin_circuit_statuses()
+    except Exception as exc:
+        logger.warning(f"获取插件熔断状态失败: {exc}")
+        return {}
+
+
+def _is_runtime_loading() -> bool:
+    try:
+        from src.plugin_runtime.integration import get_plugin_runtime_manager
+
+        return bool(get_plugin_runtime_manager().is_loading)
+    except Exception as exc:
+        logger.warning(f"获取插件运行时加载中状态失败: {exc}")
+        return False
+
+
 def _build_update_work_path(plugin_path: Path, plugin_id: str, directory_name: str) -> Path:
     safe_plugin_id = "".join(char if char.isalnum() or char in "._-" else "_" for char in plugin_id)
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
@@ -171,6 +192,7 @@ async def _clone_plugin_repository_for_update(
             mirror_id=request.mirror_id,
             depth=1,
             operation="update",
+            plugin_id=request.plugin_id,
         )
 
     return await service.clone_repository(
@@ -181,6 +203,7 @@ async def _clone_plugin_repository_for_update(
         custom_url=repo_url,
         depth=1,
         operation="update",
+        plugin_id=request.plugin_id,
     )
 
 
@@ -268,9 +291,10 @@ async def _release_plugin_runtime_before_delete(plugin_id: str, plugin_path: Pat
     try:
         _write_plugin_disabled_for_uninstall(plugin_path)
 
+        from src.common.runtime_loop import run_on_main_loop
         from src.plugin_runtime.integration import get_plugin_runtime_manager
 
-        return await get_plugin_runtime_manager().reload_plugins_globally([plugin_id], reason="uninstall")
+        return await run_on_main_loop(get_plugin_runtime_manager().reload_plugins_globally([plugin_id], reason="uninstall"))
     except Exception as exc:
         logger.warning(f"插件 {plugin_id} 删除前运行时卸载失败，将继续尝试删除文件: {exc}")
         return False
@@ -325,10 +349,17 @@ async def install_plugin(request: InstallPluginRequest, maibot_session: Optional
                 branch=request.branch,
                 mirror_id=request.mirror_id,
                 depth=1,
+                plugin_id=plugin_id,
             )
         else:
             result = await service.clone_repository(
-                owner=owner, repo=repo, target_path=target_path, branch=request.branch, custom_url=repo_url, depth=1
+                owner=owner,
+                repo=repo,
+                target_path=target_path,
+                branch=request.branch,
+                custom_url=repo_url,
+                depth=1,
+                plugin_id=plugin_id,
             )
 
         if not result.get("success"):
@@ -635,6 +666,8 @@ async def get_installed_plugins(maibot_session: Optional[str] = Cookie(None)) ->
     try:
         installed_plugins: List[Dict[str, Any]] = []
         runtime_statuses = _get_runtime_plugin_load_statuses()
+        circuit_statuses = _get_runtime_plugin_circuit_statuses()
+        runtime_loading = _is_runtime_loading()
         for plugin_path in iter_plugin_directories():
             folder_name = plugin_path.name
             if folder_name.startswith(".") or folder_name.startswith("__"):
@@ -656,6 +689,9 @@ async def get_installed_plugins(maibot_session: Optional[str] = Cookie(None)) ->
                 plugin_id = _infer_plugin_id(folder_name, manifest, manifest_path)
                 enabled = _read_plugin_enabled(plugin_id, plugin_path)
                 load_status = runtime_statuses.get(plugin_id, "unknown")
+                if enabled and load_status == "unknown" and runtime_loading:
+                    load_status = "loading"
+                circuit_status = circuit_statuses.get(plugin_id)
                 installed_plugins.append(
                     {
                         "id": plugin_id,
@@ -665,6 +701,7 @@ async def get_installed_plugins(maibot_session: Optional[str] = Cookie(None)) ->
                         "disabled": not enabled,
                         "loaded": load_status == "success",
                         "load_status": "disabled" if not enabled else load_status,
+                        "circuit_status": circuit_status,
                     }
                 )
             except json.JSONDecodeError as e:

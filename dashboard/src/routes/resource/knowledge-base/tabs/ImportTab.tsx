@@ -1,6 +1,6 @@
-import type { Dispatch, SetStateAction } from 'react'
+import { useMemo, useState } from 'react'
 
-import { ChevronLeft, ChevronRight, Loader2, RefreshCw, SlidersHorizontal, Upload } from 'lucide-react'
+import { Check, ChevronLeft, ChevronRight, Loader2, RefreshCw, Search, SlidersHorizontal, Upload } from 'lucide-react'
 
 import { MemoryMiniTabs } from '@/components/memory/MemoryMiniTabs'
 import { MemoryProgressIndicator } from '@/components/memory/MemoryProgressIndicator'
@@ -20,16 +20,13 @@ import { Textarea } from '@/components/ui/textarea'
 import { ThinkingIllustration } from '@/components/ui/thinking-illustration'
 import { cn } from '@/lib/utils'
 import type {
-  MemoryImportChunkPayload,
-  MemoryImportFilePayload,
-  MemoryImportInputMode,
-  MemoryImportRetrySummary,
-  MemoryImportSettings,
+  MemoryImportChatTargetPayload,
   MemoryImportTaskKind,
-  MemoryImportTaskPayload,
 } from '@/lib/memory-api'
 
 import { IMPORT_CHUNK_PAGE_SIZE, IMPORT_KIND_OPTIONS, RUNNING_IMPORT_STATUS } from '../constants'
+import type { UseImportFormResult } from '../hooks/useImportForm'
+import type { UseImportQueueResult } from '../hooks/useImportQueue'
 import {
   formatImportTime,
   formatProgressPercent,
@@ -55,176 +52,127 @@ function formatChunkSummary(done: unknown, total: unknown, failed: unknown, canc
   return parts.join(' · ')
 }
 
-export interface ImportTabProps {
-  importCreateMode: MemoryImportTaskKind
-  setImportCreateMode: Dispatch<SetStateAction<MemoryImportTaskKind>>
-  importSettings: MemoryImportSettings
-  importCommonFileConcurrency: string
-  setImportCommonFileConcurrency: Dispatch<SetStateAction<string>>
-  importCommonChunkConcurrency: string
-  setImportCommonChunkConcurrency: Dispatch<SetStateAction<string>>
-  importCommonLlmEnabled: boolean
-  setImportCommonLlmEnabled: Dispatch<SetStateAction<boolean>>
-  importCommonChatLog: boolean
-  setImportCommonChatLog: Dispatch<SetStateAction<boolean>>
-  importCommonStrategyOverride: string
-  setImportCommonStrategyOverride: Dispatch<SetStateAction<string>>
-  importCommonDedupePolicy: string
-  setImportCommonDedupePolicy: Dispatch<SetStateAction<string>>
-  importCommonChatReferenceTime: string
-  setImportCommonChatReferenceTime: Dispatch<SetStateAction<string>>
-  importCommonForce: boolean
-  setImportCommonForce: Dispatch<SetStateAction<boolean>>
-  importCommonClearManifest: boolean
-  setImportCommonClearManifest: Dispatch<SetStateAction<boolean>>
-
-  uploadInputMode: MemoryImportInputMode
-  setUploadInputMode: Dispatch<SetStateAction<MemoryImportInputMode>>
-  uploadFiles: File[]
-  setUploadFiles: Dispatch<SetStateAction<File[]>>
-
-  pasteName: string
-  setPasteName: Dispatch<SetStateAction<string>>
-  pasteMode: MemoryImportInputMode
-  setPasteMode: Dispatch<SetStateAction<MemoryImportInputMode>>
-  pasteContent: string
-  setPasteContent: Dispatch<SetStateAction<string>>
-
-  rawAlias: string
-  setRawAlias: Dispatch<SetStateAction<string>>
-  rawInputMode: MemoryImportInputMode
-  setRawInputMode: Dispatch<SetStateAction<MemoryImportInputMode>>
-  rawRelativePath: string
-  setRawRelativePath: Dispatch<SetStateAction<string>>
-  rawGlob: string
-  setRawGlob: Dispatch<SetStateAction<string>>
-  rawRecursive: boolean
-  setRawRecursive: Dispatch<SetStateAction<boolean>>
-
-  openieAlias: string
-  setOpenieAlias: Dispatch<SetStateAction<string>>
-  openieRelativePath: string
-  setOpenieRelativePath: Dispatch<SetStateAction<string>>
-  openieIncludeAllJson: boolean
-  setOpenieIncludeAllJson: Dispatch<SetStateAction<boolean>>
-
-  convertAlias: string
-  setConvertAlias: Dispatch<SetStateAction<string>>
-  convertTargetAlias: string
-  setConvertTargetAlias: Dispatch<SetStateAction<string>>
-  convertRelativePath: string
-  setConvertRelativePath: Dispatch<SetStateAction<string>>
-  convertTargetRelativePath: string
-  setConvertTargetRelativePath: Dispatch<SetStateAction<string>>
-  convertDimension: string
-  setConvertDimension: Dispatch<SetStateAction<string>>
-  convertBatchSize: string
-  setConvertBatchSize: Dispatch<SetStateAction<string>>
-
-  backfillAlias: string
-  setBackfillAlias: Dispatch<SetStateAction<string>>
-  backfillLimit: string
-  setBackfillLimit: Dispatch<SetStateAction<string>>
-  backfillRelativePath: string
-  setBackfillRelativePath: Dispatch<SetStateAction<string>>
-  backfillDryRun: boolean
-  setBackfillDryRun: Dispatch<SetStateAction<boolean>>
-  backfillNoCreatedFallback: boolean
-  setBackfillNoCreatedFallback: Dispatch<SetStateAction<boolean>>
-
-  maibotSourceDb: string
-  setMaibotSourceDb: Dispatch<SetStateAction<string>>
-  maibotTimeFrom: string
-  setMaibotTimeFrom: Dispatch<SetStateAction<string>>
-  maibotTimeTo: string
-  setMaibotTimeTo: Dispatch<SetStateAction<string>>
-  maibotStartId: string
-  setMaibotStartId: Dispatch<SetStateAction<string>>
-  maibotEndId: string
-  setMaibotEndId: Dispatch<SetStateAction<string>>
-  maibotStreamIds: string
-  setMaibotStreamIds: Dispatch<SetStateAction<string>>
-  maibotGroupIds: string
-  setMaibotGroupIds: Dispatch<SetStateAction<string>>
-  maibotUserIds: string
-  setMaibotUserIds: Dispatch<SetStateAction<string>>
-  maibotReadBatchSize: string
-  setMaibotReadBatchSize: Dispatch<SetStateAction<string>>
-  maibotCommitWindowRows: string
-  setMaibotCommitWindowRows: Dispatch<SetStateAction<string>>
-  maibotEmbedWorkers: string
-  setMaibotEmbedWorkers: Dispatch<SetStateAction<string>>
-  maibotNoResume: boolean
-  setMaibotNoResume: Dispatch<SetStateAction<boolean>>
-  maibotResetState: boolean
-  setMaibotResetState: Dispatch<SetStateAction<boolean>>
-  maibotDryRun: boolean
-  setMaibotDryRun: Dispatch<SetStateAction<boolean>>
-  maibotVerifyOnly: boolean
-  setMaibotVerifyOnly: Dispatch<SetStateAction<boolean>>
-
-  submitImportByMode: () => Promise<void>
-  creatingImport: boolean
-
-  pathResolveAlias: string
-  setPathResolveAlias: Dispatch<SetStateAction<string>>
-  importAliasKeys: string[]
-  pathResolveRelativePath: string
-  setPathResolveRelativePath: Dispatch<SetStateAction<string>>
-  pathResolveMustExist: boolean
-  setPathResolveMustExist: Dispatch<SetStateAction<boolean>>
-  resolveImportPath: () => Promise<void>
-  resolvingPath: boolean
-  pathResolveOutput: string
-
-  refreshImportQueue: () => Promise<void>
-  runningImportTasks: MemoryImportTaskPayload[]
-  queuedImportTasks: MemoryImportTaskPayload[]
-  recentImportTasks: MemoryImportTaskPayload[]
-  selectedImportTaskId: string
-  selectImportTask: (taskId: string) => Promise<void>
-  importAutoPolling: boolean
-  setImportAutoPolling: Dispatch<SetStateAction<boolean>>
-  importPollInterval: number
-  importErrorText: string
-
-  cancelSelectedImportTask: () => Promise<void>
-  retrySelectedImportTask: () => Promise<void>
-  selectedImportTaskLoading: boolean
-  selectedImportTaskResolved: MemoryImportTaskPayload | null | undefined
-  selectedImportRetrySummary: MemoryImportRetrySummary | null | undefined
-  selectedImportTaskErrorText: string
-
-  selectedImportFiles: MemoryImportFilePayload[]
-  selectedImportFileId: string
-  selectImportFile: (fileId: string) => Promise<void>
-
-  importChunkTotal: number
-  importChunkOffset: number
-  moveImportChunkPage: (direction: -1 | 1) => Promise<void>
-  canImportChunkPrev: boolean
-  canImportChunkNext: boolean
-  importChunksLoading: boolean
-  selectedImportChunks: MemoryImportChunkPayload[]
+function compactTextParts(parts: Array<string | null | undefined>): string[] {
+  return parts.map((part) => String(part ?? '').trim()).filter(Boolean)
 }
 
-export function ImportTab(props: ImportTabProps) {
+function getUserIdLabel(chat: MemoryImportChatTargetPayload): string {
+  const userId = String(chat.user_id ?? '').trim()
+  if (!userId) {
+    return ''
+  }
+
+  const platform = String(chat.platform ?? '').trim().toLowerCase()
+  if (platform === 'qq') {
+    return `QQ ${userId}`
+  }
+  if (platform === 'wechat' || platform === 'wx') {
+    return `微信 ${userId}`
+  }
+  return `用户 ID ${userId}`
+}
+
+function getChatTargetMetaParts(chat: MemoryImportChatTargetPayload): string[] {
+  return compactTextParts([
+    chat.platform || '未知平台',
+    chat.is_group ? '群聊' : '私聊',
+    chat.group_id ? `群号 ${chat.group_id}` : '',
+    getUserIdLabel(chat),
+  ])
+}
+
+function getChatTargetSearchText(chat: MemoryImportChatTargetPayload): string {
+  return compactTextParts([
+    chat.chat_name,
+    chat.platform,
+    chat.group_id,
+    chat.user_id,
+    chat.account_id,
+    chat.scope,
+    chat.chat_id,
+  ])
+    .join(' ')
+    .toLowerCase()
+}
+
+function getChatTargetValueLabel(chat: MemoryImportChatTargetPayload | undefined): string {
+  if (!chat) {
+    return '不绑定聊天流'
+  }
+  const idLabel = chat.group_id || chat.user_id
+  return idLabel ? `${chat.chat_name} · ${idLabel}` : chat.chat_name
+}
+
+function filterChatTargets(
+  targets: MemoryImportChatTargetPayload[],
+  query: string,
+): MemoryImportChatTargetPayload[] {
+  const normalizedQuery = query.trim().toLowerCase()
+  if (!normalizedQuery) {
+    return targets.slice(0, 8)
+  }
+  return targets.filter((chat) => getChatTargetSearchText(chat).includes(normalizedQuery)).slice(0, 12)
+}
+
+export interface ImportTabProps {
+  queue: UseImportQueueResult
+  form: UseImportFormResult
+}
+
+export function ImportTab({ queue, form }: ImportTabProps) {
+  const {
+    refreshImportQueue,
+    runningImportTasks,
+    queuedImportTasks,
+    recentImportTasks,
+    selectedImportTaskId,
+    selectImportTask,
+    importAutoPolling,
+    setImportAutoPolling,
+    importPollInterval,
+    importErrorText,
+    cancelSelectedImportTask,
+    retrySelectedImportTask,
+    selectedImportTaskLoading,
+    selectedImportTaskResolved,
+    selectedImportRetrySummary,
+    selectedImportTaskErrorText,
+    selectedImportFiles,
+    selectedImportFileId,
+    selectImportFile,
+    importChunkTotal,
+    importChunkOffset,
+    moveImportChunkPage,
+    canImportChunkPrev,
+    canImportChunkNext,
+    importChunksLoading,
+    selectedImportChunks,
+  } = queue
   const {
     importCreateMode,
     setImportCreateMode,
     importSettings,
+    importChatTargets,
     importCommonFileConcurrency,
     setImportCommonFileConcurrency,
     importCommonChunkConcurrency,
     setImportCommonChunkConcurrency,
+    importCommonNarrativeWindowSize,
+    setImportCommonNarrativeWindowSize,
+    importCommonNarrativeOverlap,
+    setImportCommonNarrativeOverlap,
+    importCommonFactualTargetSize,
+    setImportCommonFactualTargetSize,
     importCommonLlmEnabled,
     setImportCommonLlmEnabled,
-    importCommonChatLog,
-    setImportCommonChatLog,
     importCommonStrategyOverride,
     setImportCommonStrategyOverride,
     importCommonDedupePolicy,
     setImportCommonDedupePolicy,
+    importCommonChatLog,
+    setImportCommonChatLog,
+    importCommonChatId,
+    setImportCommonChatId,
     importCommonChatReferenceTime,
     setImportCommonChatReferenceTime,
     importCommonForce,
@@ -321,33 +269,24 @@ export function ImportTab(props: ImportTabProps) {
     resolveImportPath,
     resolvingPath,
     pathResolveOutput,
-    refreshImportQueue,
-    runningImportTasks,
-    queuedImportTasks,
-    recentImportTasks,
-    selectedImportTaskId,
-    selectImportTask,
-    importAutoPolling,
-    setImportAutoPolling,
-    importPollInterval,
-    importErrorText,
-    cancelSelectedImportTask,
-    retrySelectedImportTask,
-    selectedImportTaskLoading,
-    selectedImportTaskResolved,
-    selectedImportRetrySummary,
-    selectedImportTaskErrorText,
-    selectedImportFiles,
-    selectedImportFileId,
-    selectImportFile,
-    importChunkTotal,
-    importChunkOffset,
-    moveImportChunkPage,
-    canImportChunkPrev,
-    canImportChunkNext,
-    importChunksLoading,
-    selectedImportChunks,
-  } = props
+  } = form
+  const [chatTargetQuery, setChatTargetQuery] = useState('')
+  const selectedImportChatTarget = useMemo(
+    () => importChatTargets.find((chat) => chat.chat_id === importCommonChatId.trim()),
+    [importChatTargets, importCommonChatId],
+  )
+  const visibleImportChatTargets = useMemo(
+    () => filterChatTargets(importChatTargets, chatTargetQuery),
+    [chatTargetQuery, importChatTargets],
+  )
+  const importMaxChunkChars = Number.isFinite(Number(importSettings.max_chunk_chars))
+    ? Number(importSettings.max_chunk_chars)
+    : 3200
+  const narrativeWindowForOverlap = Number.isFinite(
+    Number(importCommonNarrativeWindowSize || importSettings.default_narrative_window_size),
+  )
+    ? Number(importCommonNarrativeWindowSize || importSettings.default_narrative_window_size)
+    : 1600
 
   return (
     <TabsContent
@@ -427,6 +366,70 @@ export function ImportTab(props: ImportTabProps) {
                     </div>
                     <div className="mt-0.5 pl-6 text-[11px] leading-snug text-muted-foreground">适合导入聊天记录，会尽量保留时间和对话上下文。</div>
                   </div>
+                  <div className="grid gap-3 rounded-md border bg-background/70 p-3 md:col-span-2 md:grid-cols-[minmax(0,1fr)_minmax(18rem,28rem)]">
+                    <div className="min-w-0">
+                      <Label>归属聊天流</Label>
+                      <div className="mt-0.5 text-xs text-muted-foreground">可输入群号、QQ 号或聊天名检索；选择后，这批记忆只会在对应聊天流的检索中默认出现。</div>
+                    </div>
+                    <div className="space-y-2">
+                      <div className="relative">
+                        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                        <Input
+                          aria-label="搜索归属聊天流"
+                          value={chatTargetQuery}
+                          onChange={(event) => setChatTargetQuery(event.target.value)}
+                          placeholder="输入群号、QQ 号或聊天名"
+                          className="pl-9"
+                        />
+                      </div>
+                      <div className="rounded-md border bg-background">
+                        <button
+                          type="button"
+                          className={cn(
+                            'flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-accent',
+                            !importCommonChatId && 'bg-accent/70',
+                          )}
+                          onClick={() => setImportCommonChatId('')}
+                        >
+                          <Check className={cn('h-4 w-4 shrink-0', !importCommonChatId ? 'opacity-100' : 'opacity-0')} />
+                          <span className="truncate">不绑定聊天流</span>
+                        </button>
+                        {visibleImportChatTargets.length > 0 ? (
+                          <div className="max-h-44 overflow-y-auto border-t">
+                            {visibleImportChatTargets.map((chat) => (
+                              <button
+                                key={chat.chat_id}
+                                type="button"
+                                className={cn(
+                                  'flex w-full items-start gap-2 px-3 py-2 text-left text-sm hover:bg-accent',
+                                  importCommonChatId.trim() === chat.chat_id && 'bg-accent/70',
+                                )}
+                                onClick={() => setImportCommonChatId(chat.chat_id)}
+                              >
+                                <Check
+                                  className={cn(
+                                    'mt-0.5 h-4 w-4 shrink-0',
+                                    importCommonChatId.trim() === chat.chat_id ? 'opacity-100' : 'opacity-0',
+                                  )}
+                                />
+                                <span className="min-w-0 flex-1">
+                                  <span className="block truncate font-medium">{chat.chat_name}</span>
+                                  <span className="block truncate text-[11px] text-muted-foreground">
+                                    {getChatTargetMetaParts(chat).join(' · ')}
+                                  </span>
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="border-t px-3 py-3 text-sm text-muted-foreground">没有找到匹配的聊天流</div>
+                        )}
+                      </div>
+                      <div className="truncate text-[11px] leading-snug text-muted-foreground">
+                        当前选择：{getChatTargetValueLabel(selectedImportChatTarget)}
+                      </div>
+                    </div>
+                  </div>
                 </div>
 
                 <details className="rounded-md border bg-background/70 p-3 text-sm">
@@ -434,6 +437,47 @@ export function ImportTab(props: ImportTabProps) {
                     高级参数（通常不用修改）
                   </summary>
                   <div className="mt-3 grid gap-3">
+                    <div className="grid gap-3 md:grid-cols-3">
+                      <div className="space-y-1">
+                        <Label>叙事抽取窗口</Label>
+                        <Input
+                          type="number"
+                          min={200}
+                          max={importMaxChunkChars}
+                          value={importCommonNarrativeWindowSize}
+                          onChange={(event) => setImportCommonNarrativeWindowSize(event.target.value)}
+                        />
+                        <div className="text-[11px] leading-snug text-muted-foreground">
+                          默认 {Number(importSettings.default_narrative_window_size ?? 1600)}，用于 narrative/聊天日志。
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <Label>叙事重叠字符</Label>
+                        <Input
+                          type="number"
+                          min={0}
+                          max={Math.max(0, narrativeWindowForOverlap - 1)}
+                          value={importCommonNarrativeOverlap}
+                          onChange={(event) => setImportCommonNarrativeOverlap(event.target.value)}
+                        />
+                        <div className="text-[11px] leading-snug text-muted-foreground">
+                          默认 {Number(importSettings.default_narrative_overlap ?? 400)}，保留跨块上下文。
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <Label>事实分块目标</Label>
+                        <Input
+                          type="number"
+                          min={200}
+                          max={importMaxChunkChars}
+                          value={importCommonFactualTargetSize}
+                          onChange={(event) => setImportCommonFactualTargetSize(event.target.value)}
+                        />
+                        <div className="text-[11px] leading-snug text-muted-foreground">
+                          默认 {Number(importSettings.default_factual_target_size ?? 1200)}，用于 factual 结构感知切分。
+                        </div>
+                      </div>
+                    </div>
                     <div className="space-y-1">
                       <Label>指定抽取策略</Label>
                       <Input
@@ -454,6 +498,15 @@ export function ImportTab(props: ImportTabProps) {
                         value={importCommonChatReferenceTime}
                         onChange={(event) => setImportCommonChatReferenceTime(event.target.value)}
                       />
+                    </div>
+                    <div className="space-y-1">
+                      <Label>聊天流 ID</Label>
+                      <Input
+                        value={importCommonChatId}
+                        onChange={(event) => setImportCommonChatId(event.target.value)}
+                        placeholder="留空表示不绑定"
+                      />
+                      <div className="text-[11px] leading-snug text-muted-foreground">仅填写已存在的真实聊天流 ID；上方下拉无法覆盖时再手动填写。</div>
                     </div>
                     <div className="flex items-center gap-2 text-sm">
                       <Checkbox

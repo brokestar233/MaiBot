@@ -21,6 +21,8 @@ export interface MaisakaToolCall {
   name: string
   arguments?: Record<string, unknown>
   arguments_raw?: string
+  source?: 'reasoning' | 'response' | string
+  source_label?: string
 }
 
 export interface SessionStartEvent {
@@ -61,6 +63,11 @@ export interface MessageIngestedEvent {
   speaker_name: string
   content: string
   message_id: string
+  reply_to?: MaisakaReplyPreview | null
+  media?: MaisakaMessageMedia[]
+  platform?: string
+  user_id?: string
+  group_id?: string
   timestamp: number
 }
 
@@ -69,17 +76,43 @@ export interface MessageSentEvent {
   speaker_name: string
   content: string
   message_id: string
+  reply_to?: MaisakaReplyPreview | null
+  media?: MaisakaMessageMedia[]
   source_kind?: string
+  platform?: string
+  user_id?: string
+  group_id?: string
   timestamp: number
 }
 
-export interface CycleStartEvent {
+export interface MessageUpdatedEvent {
   session_id: string
-  cycle_id: number
-  round_index: number
-  max_rounds: number
-  history_count: number
+  speaker_name: string
+  content: string
+  message_id: string
+  reply_to?: MaisakaReplyPreview | null
+  media?: MaisakaMessageMedia[]
+  source_kind?: string
+  platform?: string
+  user_id?: string
+  group_id?: string
   timestamp: number
+}
+
+export interface MaisakaReplyPreview {
+  message_id: string
+  sender_name: string
+  content: string
+}
+
+export interface MaisakaMessageMedia {
+  kind: 'image' | 'emoji'
+  hash: string
+  text: string
+  url: string
+  data_url?: string
+  default_original?: boolean
+  index?: number
 }
 
 export interface TimingGateResultEvent {
@@ -161,9 +194,12 @@ export interface MaisakaFinalizedToolResult {
   tool_call_id: string
   tool_name: string
   tool_args: Record<string, unknown>
+  tool_call_source?: string
+  tool_call_source_label?: string
   success: boolean
   duration_ms: number
   summary: string
+  prompt_html_uri?: string
   detail?: unknown
 }
 
@@ -182,16 +218,6 @@ export interface PlannerFinalizedEvent {
     end_reason?: string
     end_detail?: string
   }
-}
-
-export interface CycleEndEvent {
-  session_id: string
-  cycle_id: number
-  time_records: Record<string, number>
-  agent_state: string
-  end_reason?: string
-  end_detail?: string
-  timestamp: number
 }
 
 export interface ReplierRequestEvent {
@@ -223,13 +249,12 @@ export type MaisakaMonitorEvent =
   | { type: 'stage.snapshot'; data: StageSnapshotEvent }
   | { type: 'message.ingested'; data: MessageIngestedEvent }
   | { type: 'message.sent'; data: MessageSentEvent }
-  | { type: 'cycle.start'; data: CycleStartEvent }
+  | { type: 'message.updated'; data: MessageUpdatedEvent }
   | { type: 'timing_gate.result'; data: TimingGateResultEvent }
   | { type: 'planner.request'; data: PlannerRequestEvent }
   | { type: 'planner.response'; data: PlannerResponseEvent }
   | { type: 'planner.finalized'; data: PlannerFinalizedEvent }
   | { type: 'tool.execution'; data: ToolExecutionEvent }
-  | { type: 'cycle.end'; data: CycleEndEvent }
   | { type: 'replier.request'; data: ReplierRequestEvent }
   | { type: 'replier.response'; data: ReplierResponseEvent }
 

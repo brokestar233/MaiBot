@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback } from 'react'
+﻿import { useState, useEffect } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
-import { fetchWithAuth } from '@/lib/fetch-with-auth'
+import { backendApi } from '@/lib/http'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -38,17 +39,25 @@ interface MirrorConfig {
   updated_at?: string
 }
 
-export function PluginMirrorsPage() {
+const PLUGIN_MARKET_COMPATIBLE_ONLY_KEY = 'plugins-market-compatible-only'
+
+interface PluginMirrorsPageProps {
+  embedded?: boolean
+}
+
+export function PluginMirrorsPage({ embedded = false }: PluginMirrorsPageProps) {
   const navigate = useNavigate()
+  const pluginsRoute: '/plugins' | '/plugins/embed' = embedded ? '/plugins/embed' : '/plugins'
   const { toast } = useToast()
-  const [mirrors, setMirrors] = useState<MirrorConfig[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const queryClient = useQueryClient()
   const [editingMirror, setEditingMirror] = useState<MirrorConfig | null>(null)
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
+  const [showCompatibleOnly, setShowCompatibleOnly] = useState(
+    () => localStorage.getItem(PLUGIN_MARKET_COMPATIBLE_ONLY_KEY) !== 'false'
+  )
 
-  // 表单状态
+  // 琛ㄥ崟鐘舵€?
   const [formData, setFormData] = useState({
     id: '',
     name: '',
@@ -58,50 +67,34 @@ export function PluginMirrorsPage() {
     priority: 1
   })
 
-  // 加载镜像源列表
-  const loadMirrors = useCallback(async () => {
-    try {
-      setLoading(true)
-      setError(null)
-      
-      const response = await fetchWithAuth('/api/webui/plugins/mirrors')
-      
-      if (!response.ok) {
-        throw new Error('获取镜像源列表失败')
-      }
-      
-      const data = await response.json()
-      setMirrors(data.mirrors || [])
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : '加载镜像源失败'
-      setError(errorMessage)
-      toast({
-        title: '加载失败',
-        description: errorMessage,
-        variant: 'destructive',
-      })
-    } finally {
-      setLoading(false)
-    }
-  }, [toast])
+  // 加载镜像源列表：失败由 mirrorsQuery.isError 局部呈现，不弹全局 toast
+  const mirrorsQuery = useQuery({
+    queryKey: ['plugin-mirrors'],
+    queryFn: () =>
+      backendApi.get<{ mirrors?: MirrorConfig[] }>('/api/webui/plugins/mirrors', {
+        errorMessage: '获取镜像源列表失败',
+      }),
+  })
+  const mirrors = mirrorsQuery.data?.mirrors || []
+  const loading = mirrorsQuery.isPending
+
+  // 任何写操作成功后，整体失效镜像源列表
+  const invalidateMirrors = () =>
+    queryClient.invalidateQueries({ queryKey: ['plugin-mirrors'] })
 
   useEffect(() => {
-    loadMirrors()
-  }, [loadMirrors])
+    localStorage.setItem(PLUGIN_MARKET_COMPATIBLE_ONLY_KEY, String(showCompatibleOnly))
+  }, [showCompatibleOnly])
 
-  // 添加镜像源
-  const handleAddMirror = async () => {
-    try {
-      const response = await fetchWithAuth('/api/webui/plugins/mirrors', {
-        method: 'POST',
-        body: JSON.stringify(formData)
-      })
-
-      if (!response.ok) {
-        const errorData = await response.json()
-        throw new Error(errorData.detail || '添加镜像源失败')
-      }
-
+  // 添加镜像源（失败由全局 mutation 错误 toast 呈现）
+  const addMutation = useMutation({
+    mutationFn: (body: typeof formData) =>
+      backendApi.post('/api/webui/plugins/mirrors', {
+        body,
+        errorMessage: '添加镜像源失败',
+      }),
+    meta: { errorTitle: '添加失败' },
+    onSuccess: () => {
       toast({
         title: '添加成功',
         description: '镜像源已添加'
@@ -116,36 +109,23 @@ export function PluginMirrorsPage() {
         enabled: true,
         priority: 1
       })
-      loadMirrors()
-    } catch (err) {
-      toast({
-        title: '添加失败',
-        description: err instanceof Error ? err.message : '未知错误',
-        variant: 'destructive'
-      })
-    }
+      invalidateMirrors()
+    },
+  })
+
+  const handleAddMirror = () => {
+    addMutation.mutate(formData)
   }
 
-  // 更新镜像源
-  const handleUpdateMirror = async () => {
-    if (!editingMirror) return
-
-    try {
-      const response = await fetchWithAuth(`/api/webui/plugins/mirrors/${editingMirror.id}`, {
-        method: 'PUT',
-        body: JSON.stringify({
-          name: formData.name,
-          raw_prefix: formData.raw_prefix,
-          clone_prefix: formData.clone_prefix,
-          enabled: formData.enabled,
-          priority: formData.priority
-        })
-      })
-
-      if (!response.ok) {
-        throw new Error('更新镜像源失败')
-      }
-
+  // 更新镜像源（失败由全局 mutation 错误 toast 呈现）
+  const updateMutation = useMutation({
+    mutationFn: (vars: { id: string; body: Partial<MirrorConfig> }) =>
+      backendApi.put(`/api/webui/plugins/mirrors/${vars.id}`, {
+        body: vars.body,
+        errorMessage: '更新镜像源失败',
+      }),
+    meta: { errorTitle: '更新失败' },
+    onSuccess: () => {
       toast({
         title: '更新成功',
         description: '镜像源已更新'
@@ -153,66 +133,65 @@ export function PluginMirrorsPage() {
 
       setIsEditDialogOpen(false)
       setEditingMirror(null)
-      loadMirrors()
-    } catch (err) {
-      toast({
-        title: '更新失败',
-        description: err instanceof Error ? err.message : '未知错误',
-        variant: 'destructive'
-      })
-    }
+      invalidateMirrors()
+    },
+  })
+
+  const handleUpdateMirror = () => {
+    if (!editingMirror) return
+
+    updateMutation.mutate({
+      id: editingMirror.id,
+      body: {
+        name: formData.name,
+        raw_prefix: formData.raw_prefix,
+        clone_prefix: formData.clone_prefix,
+        enabled: formData.enabled,
+        priority: formData.priority
+      },
+    })
   }
 
-  // 删除镜像源
-  const handleDeleteMirror = async (id: string) => {
-    if (!confirm('确定要删除这个镜像源吗？')) return
-
-    try {
-      const response = await fetchWithAuth(`/api/webui/plugins/mirrors/${id}`, {
-        method: 'DELETE'
-      })
-
-      if (!response.ok) {
-        throw new Error('删除镜像源失败')
-      }
-
+  // 删除镜像源（失败由全局 mutation 错误 toast 呈现）
+  const deleteMutation = useMutation({
+    mutationFn: (id: string) =>
+      backendApi.delete(`/api/webui/plugins/mirrors/${id}`, {
+        errorMessage: '删除镜像源失败',
+      }),
+    meta: { errorTitle: '删除失败' },
+    onSuccess: () => {
       toast({
         title: '删除成功',
         description: '镜像源已删除'
       })
 
-      loadMirrors()
-    } catch (err) {
-      toast({
-        title: '删除失败',
-        description: err instanceof Error ? err.message : '未知错误',
-        variant: 'destructive'
-      })
-    }
+      invalidateMirrors()
+    },
+  })
+
+  const handleDeleteMirror = (id: string) => {
+    if (!confirm('确定要删除这个镜像源吗？')) return
+
+    deleteMutation.mutate(id)
   }
 
-  // 切换启用状态
-  const handleToggleEnabled = async (mirror: MirrorConfig) => {
-    try {
-      const response = await fetchWithAuth(`/api/webui/plugins/mirrors/${mirror.id}`, {
-        method: 'PUT',
-        body: JSON.stringify({
+  // 鍒囨崲鍚敤鐘舵€?
+  const toggleEnabledMutation = useMutation({
+    mutationFn: (mirror: MirrorConfig) =>
+      backendApi.put(`/api/webui/plugins/mirrors/${mirror.id}`, {
+        body: {
           enabled: !mirror.enabled
-        })
-      })
+        },
+        errorMessage: '更新状态失败',
+      }),
+    meta: { errorTitle: '更新失败' },
+    onSuccess: () => {
+      invalidateMirrors()
+    },
+  })
 
-      if (!response.ok) {
-        throw new Error('更新状态失败')
-      }
-
-      loadMirrors()
-    } catch (err) {
-      toast({
-        title: '更新失败',
-        description: err instanceof Error ? err.message : '未知错误',
-        variant: 'destructive'
-      })
-    }
+  const handleToggleEnabled = (mirror: MirrorConfig) => {
+    toggleEnabledMutation.mutate(mirror)
   }
 
   // 打开编辑对话框
@@ -229,50 +208,45 @@ export function PluginMirrorsPage() {
     setIsEditDialogOpen(true)
   }
 
-  // 调整优先级
-  const adjustPriority = async (mirror: MirrorConfig, direction: 'up' | 'down') => {
+  // 调整优先级（失败由全局 mutation 错误 toast 呈现）
+  const adjustPriorityMutation = useMutation({
+    mutationFn: (vars: { id: string; priority: number }) =>
+      backendApi.put(`/api/webui/plugins/mirrors/${vars.id}`, {
+        body: {
+          priority: vars.priority
+        },
+        errorMessage: '更新优先级失败',
+      }),
+    meta: { errorTitle: '更新失败' },
+    onSuccess: () => {
+      invalidateMirrors()
+    },
+  })
+
+  const adjustPriority = (mirror: MirrorConfig, direction: 'up' | 'down') => {
     const newPriority = direction === 'up' ? mirror.priority - 1 : mirror.priority + 1
     if (newPriority < 1) return
 
-    try {
-      const response = await fetchWithAuth(`/api/webui/plugins/mirrors/${mirror.id}`, {
-        method: 'PUT',
-        body: JSON.stringify({
-          priority: newPriority
-        })
-      })
-
-      if (!response.ok) {
-        throw new Error('更新优先级失败')
-      }
-
-      loadMirrors()
-    } catch (err) {
-      toast({
-        title: '更新失败',
-        description: err instanceof Error ? err.message : '未知错误',
-        variant: 'destructive'
-      })
-    }
+    adjustPriorityMutation.mutate({ id: mirror.id, priority: newPriority })
   }
 
   return (
     <ScrollArea className="h-full">
       <div className="space-y-6 p-4 sm:p-6">
-        {/* 标题栏 */}
+        {/* 鏍囬鏍?*/}
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
           <div className="flex items-center gap-4">
             <Button
               variant="ghost"
               size="icon"
-              onClick={() => navigate({ to: '/plugins' })}
+              onClick={() => navigate({ to: pluginsRoute })}
             >
               <ArrowLeft className="h-5 w-5" />
             </Button>
             <div>
-              <h1 className="text-2xl sm:text-3xl font-bold">镜像源配置</h1>
+              <h1 className="text-2xl sm:text-3xl font-bold">插件商店设置</h1>
               <p className="text-sm text-muted-foreground mt-1">
-                管理 Git 克隆和文件下载的镜像源
+                管理插件市场筛选偏好和插件安装镜像源
               </p>
             </div>
           </div>
@@ -282,6 +256,24 @@ export function PluginMirrorsPage() {
           </Button>
         </div>
 
+        <Card className="p-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="space-y-1">
+              <Label htmlFor="plugin-market-compatible-only" className="text-sm font-medium">
+                仅显示当前版本
+              </Label>
+              <p className="text-sm text-muted-foreground">
+                在插件市场默认隐藏不兼容当前麦麦版本的插件
+              </p>
+            </div>
+            <Switch
+              id="plugin-market-compatible-only"
+              checked={showCompatibleOnly}
+              onCheckedChange={setShowCompatibleOnly}
+            />
+          </div>
+        </Card>
+
         {/* 加载状态 */}
         {loading ? (
           <Card className="p-6">
@@ -289,18 +281,18 @@ export function PluginMirrorsPage() {
               <Loader2 className="h-8 w-8 animate-spin text-primary" />
             </div>
           </Card>
-        ) : error ? (
+        ) : mirrorsQuery.isError ? (
           <Card className="p-6">
             <div className="flex flex-col items-center justify-center py-8 text-center">
               <AlertTriangle className="h-12 w-12 text-destructive mb-4" />
               <h3 className="text-lg font-semibold mb-2">加载失败</h3>
-              <p className="text-sm text-muted-foreground mb-4">{error}</p>
-              <Button onClick={loadMirrors}>重新加载</Button>
+              <p className="text-sm text-muted-foreground mb-4">{mirrorsQuery.error.message}</p>
+              <Button onClick={() => mirrorsQuery.refetch()}>重新加载</Button>
             </div>
           </Card>
         ) : (
           <Card>
-            {/* 桌面端表格 */}
+            {/* 妗岄潰绔〃鏍?*/}
             <div className="hidden md:block">
               <Table aria-label="插件镜像源列表">
                 <TableHeader>

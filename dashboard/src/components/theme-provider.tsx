@@ -8,7 +8,6 @@ import type { DashboardStyle, UserThemeConfig } from '@/lib/theme/tokens'
 import {
   THEME_STORAGE_KEYS,
   loadThemeConfig,
-  migrateOldKeys,
   resetThemeToDefault,
   saveThemePartial,
 } from '@/lib/theme/storage'
@@ -53,10 +52,6 @@ export function ThemeProvider({
   }, [themeMode, systemThemeTick])
 
   useEffect(() => {
-    migrateOldKeys()
-  }, [])
-
-  useEffect(() => {
     const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
     const handleChange = () => {
       if (themeMode === 'system') {
@@ -80,8 +75,8 @@ export function ThemeProvider({
     }
 
     root.dataset.dashboardStyle = dashboardStyle
+    root.dataset.retroFocusHighlight = futureRetroConfig.focusHighlight ? 'true' : 'false'
     root.dataset.retroPaperTexture = futureRetroConfig.paperTexture ? 'true' : 'false'
-    root.dataset.retroStrongBorders = futureRetroConfig.strongBorders ? 'true' : 'false'
 
     applyThemePipeline(themeConfig, isDark)
   }, [resolvedTheme, themeConfig])
@@ -106,14 +101,7 @@ export function ThemeProvider({
 
     try {
       const result = await getBotConfig()
-      if (!result.success) {
-        return
-      }
-
-      const configData = (result.data as Record<string, unknown>).config as
-        | Record<string, unknown>
-        | undefined
-      const webuiConfig = configData?.webui as Record<string, unknown> | undefined
+      const webuiConfig = result.webui as Record<string, unknown> | undefined
       if (!webuiConfig || !('webui_style' in webuiConfig)) {
         return
       }
@@ -133,10 +121,7 @@ export function ThemeProvider({
     pendingWebUIStyleRef.current = webuiStyle
 
     try {
-      const result = await updateBotConfigSection('webui', { webui_style: webuiStyle })
-      if (!result.success) {
-        console.warn('保存 WebUI 风格配置失败:', result.error)
-      }
+      await updateBotConfigSection('webui', { webui_style: webuiStyle })
     } catch (error) {
       console.warn('保存 WebUI 风格配置失败:', error)
     } finally {

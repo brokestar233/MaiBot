@@ -1,19 +1,22 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Link } from '@tanstack/react-router'
+import {
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  Code2,
+  ExternalLink,
+  Info,
+  Layout,
+  RefreshCw,
+  Save,
+  X,
+} from 'lucide-react'
 import { parse as parseToml } from 'smol-toml'
 
-import { AlertDescription, Alert } from '@/components/ui/alert'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from '@/components/ui/alert-dialog'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { DashboardTabBar, DashboardTabTrigger } from '@/components/ui/dashboard-tabs'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { ThinkingIllustration } from '@/components/ui/thinking-illustration'
@@ -33,16 +36,21 @@ import { fieldHooks } from '@/lib/field-hooks'
 import { RestartProvider, useRestart } from '@/lib/restart-context'
 import { cn } from '@/lib/utils'
 
-import { ChevronLeft, ChevronRight, Code2, Info, Layout, Power, RefreshCw, Save } from 'lucide-react'
-
 import type { ConfigSchema } from '@/types/config-schema'
 import {
   AliasNamesHook,
+  AMemorixSharedMemoryGroupsHook,
+  AMemorixRetrievalChatsHook,
+  AMemorixRetrievalFilterMirrorHook,
+  BehaviorGroupsHook,
+  BehaviorFocusGroupsHook,
+  BehaviorLearningListHook,
   BotPlatformAccountsHook,
   ChatPromptsHook,
   ChatTalkValueRulesHook,
   ExpressionGroupsHook,
   ExpressionLearningListHook,
+  FocusWhitelistHook,
   JargonGroupsHook,
   JargonLearningListHook,
   KeywordRulesHook,
@@ -52,45 +60,28 @@ import {
   MultipleReplyStyleHook,
   RegexRulesHook,
   useAutoSave,
-  useConfigAutoSave,
 } from './bot/hooks'
 
 type ConfigSectionData = Record<string, unknown>
 // ==================== 常量定义 ====================
 /** Toast 显示前的延迟时间 (毫秒) */
 const TOAST_DISPLAY_DELAY = 500
-
-/** Tab 标签页的首选排列顺序 (host field name) */
-const TAB_ORDER = [
-  'bot',
-  'chat',
-  'expression',
-  'a_memorix',
-  'visual',
-  'message_receive',
-  'emoji',
-  'voice',
-  'response_post_process',
-  'webui',
-  'plugin_runtime',
-  'log',
-]
-
-/** 默认展示的主配置栏目 */
-const DEFAULT_VISIBLE_TAB_IDS = new Set([
-  'bot',
-  'chat',
-  'expression',
-  'a_memorix',
-  'visual',
-])
+const FILE_MODE_NOTICE_DISMISSED_KEY = 'bot-config-file-mode-notice-dismissed'
 
 // ==================== Tab 分组类型与构建 ====================
 interface TabGroup {
   id: string
   label: string
-  icon: string
+  advanced: boolean
+  order: number
   sections: string[]
+}
+
+interface SubtabPane {
+  advanced: boolean
+  content: ReactNode
+  id: string
+  label: string
 }
 
 /**
@@ -114,7 +105,7 @@ function buildTabGroupsFromSchema(schema: ConfigSchema): TabGroup[] {
     }
 
     if (!fieldSchema.uiParent) {
-      return fieldSchema.uiLabel && fieldSchema.uiIcon ? fieldName : null
+      return fieldSchema.uiLabel ? fieldName : null
     }
 
     visited.add(fieldName)
@@ -122,11 +113,12 @@ function buildTabGroupsFromSchema(schema: ConfigSchema): TabGroup[] {
   }
 
   for (const [fieldName, fieldSchema] of nestedEntries) {
-    if (fieldSchema.uiLabel && fieldSchema.uiIcon && !fieldSchema.uiParent) {
+    if (fieldSchema.uiLabel && !fieldSchema.uiParent) {
       hosts.set(fieldName, {
         id: fieldName,
         label: fieldSchema.uiLabel,
-        icon: fieldSchema.uiIcon || '',
+        advanced: Boolean(fieldSchema.uiAdvanced),
+        order: fieldSchema.uiOrder ?? Number.POSITIVE_INFINITY,
         sections: [fieldName],
       })
     }
@@ -144,11 +136,12 @@ function buildTabGroupsFromSchema(schema: ConfigSchema): TabGroup[] {
     }
   }
 
-  // 按 TAB_ORDER 排序；未列入的 tab 追加到末尾
   return Array.from(hosts.values()).sort((a, b) => {
-    const ai = TAB_ORDER.indexOf(a.id)
-    const bi = TAB_ORDER.indexOf(b.id)
-    return (ai === -1 ? Infinity : ai) - (bi === -1 ? Infinity : bi)
+    const orderDelta = a.order - b.order
+    if (orderDelta !== 0) {
+      return orderDelta
+    }
+    return a.label.localeCompare(b.label, 'zh-CN')
   })
 }
 
@@ -171,35 +164,13 @@ function BotConfigPageContent() {
   const [sourceCode, setSourceCode] = useState<string>('')
   const [hasTomlError, setHasTomlError] = useState(false)
   const [tomlErrorMessage, setTomlErrorMessage] = useState<string>('')
-  const [restartNoticeVisible, setRestartNoticeVisible] = useState(
-    () => localStorage.getItem('bot-config-restart-notice-dismissed') !== 'true'
+  const [showFileModeNotice, setShowFileModeNotice] = useState(
+    () => localStorage.getItem(FILE_MODE_NOTICE_DISMISSED_KEY) !== 'true'
   )
   const { toast } = useToast()
   const { triggerRestart, isRestarting } = useRestart()
 
-  // 配置状态
-  const [botConfig, setBotConfig] = useState<ConfigSectionData | null>(null)
-  const [personalityConfig, setPersonalityConfig] = useState<ConfigSectionData | null>(null)
-  const [chatConfig, setChatConfig] = useState<ConfigSectionData | null>(null)
-  const [expressionConfig, setExpressionConfig] = useState<ConfigSectionData | null>(null)
-  const [jargonConfig, setJargonConfig] = useState<ConfigSectionData | null>(null)
-  const [emojiConfig, setEmojiConfig] = useState<ConfigSectionData | null>(null)
-  const [visualConfig, setVisualConfig] = useState<ConfigSectionData | null>(null)
-  const [voiceConfig, setVoiceConfig] = useState<ConfigSectionData | null>(null)
-  const [messageReceiveConfig, setMessageReceiveConfig] = useState<ConfigSectionData | null>(null)
-  const [keywordReactionConfig, setKeywordReactionConfig] = useState<ConfigSectionData | null>(null)
-  const [responsePostProcessConfig, setResponsePostProcessConfig] = useState<ConfigSectionData | null>(null)
-  const [chineseTypoConfig, setChineseTypoConfig] = useState<ConfigSectionData | null>(null)
-  const [responseSplitterConfig, setResponseSplitterConfig] = useState<ConfigSectionData | null>(null)
-  const [logConfig, setLogConfig] = useState<ConfigSectionData | null>(null)
-  const [debugConfig, setDebugConfig] = useState<ConfigSectionData | null>(null)
-  const [maimMessageConfig, setMaimMessageConfig] = useState<ConfigSectionData | null>(null)
-  const [telemetryConfig, setTelemetryConfig] = useState<ConfigSectionData | null>(null)
-  const [webuiConfig, setWebuiConfig] = useState<ConfigSectionData | null>(null)
-  const [databaseConfig, setDatabaseConfig] = useState<ConfigSectionData | null>(null)
-  const [mcpConfig, setMcpConfig] = useState<ConfigSectionData | null>(null)
-  const [pluginRuntimeConfig, setPluginRuntimeConfig] = useState<ConfigSectionData | null>(null)
-  const [aMemorixConfig, setAMemorixConfig] = useState<ConfigSectionData | null>(null)
+  const [sectionValues, setSectionValues] = useState<Record<string, ConfigSectionData | null>>({})
 
   // Schema 状态（用于动态 tab 分组）
   const [configSchema, setConfigSchema] = useState<ConfigSchema | null>(null)
@@ -209,37 +180,46 @@ function BotConfigPageContent() {
   const configRef = useRef<Record<string, unknown>>({})
 
   // ==================== 辅助函数 ====================
-  
+
   /**
    * 翻译 TOML 错误信息为中文
    */
   const translateTomlError = (errorMessage: string): string => {
     // 分行处理，保留多行格式
     const lines = errorMessage.split('\n')
-    
+
     // 翻译第一行（主要错误信息）
     let firstLine = lines[0]
-    
+
     // 移除 "Error: " 前缀（如果有）
     firstLine = firstLine.replace(/^Error:\s*/, '')
-    
+
     // 常见 TOML 错误模式匹配和翻译
     const translations: Array<[RegExp, string | ((match: RegExpMatchArray) => string)]> = [
       // Invalid TOML document 系列
-      [/Invalid TOML document: unrecognized escape sequence/, 'TOML 文档错误：无法识别的转义序列（提示：在双引号字符串中使用 \\\\ 转义反斜杠，或使用单引号字符串）'],
-      [/Invalid TOML document: only letter, numbers, dashes and underscores are allowed in keys/, 'TOML 文档错误：键名只能包含字母、数字、短横线和下划线'],
+      [
+        /Invalid TOML document: unrecognized escape sequence/,
+        'TOML 文档错误：无法识别的转义序列（提示：在双引号字符串中使用 \\\\ 转义反斜杠，或使用单引号字符串）',
+      ],
+      [
+        /Invalid TOML document: only letter, numbers, dashes and underscores are allowed in keys/,
+        'TOML 文档错误：键名只能包含字母、数字、短横线和下划线',
+      ],
       [/Invalid TOML document: (.+)/, 'TOML 文档错误：$1'],
-      
+
       // 位置错误系列
       [/Unexpected character.*at line (\d+), column (\d+)/, '第 $1 行第 $2 列：意外的字符'],
       [/Expected.*at line (\d+), column (\d+)/, '第 $1 行第 $2 列：缺少必要的字符'],
       [/Invalid.*at line (\d+), column (\d+)/, '第 $1 行第 $2 列：无效的语法'],
       [/Unterminated string at line (\d+)/, '第 $1 行：字符串未正常结束（缺少引号）'],
       [/Duplicate key.*at line (\d+)/, '第 $1 行：重复的键名'],
-      [/Invalid escape sequence at line (\d+)/, '第 $1 行：无效的转义序列（提示：在双引号字符串中使用 \\\\ 转义反斜杠）'],
+      [
+        /Invalid escape sequence at line (\d+)/,
+        '第 $1 行：无效的转义序列（提示：在双引号字符串中使用 \\\\ 转义反斜杠）',
+      ],
       [/Expected.*but got.*at line (\d+)/, '第 $1 行：类型不匹配'],
       [/line (\d+), column (\d+)/, '第 $1 行第 $2 列'],
-      
+
       // 通用错误系列
       [/Unexpected end of input/, '意外的文件结束（可能缺少闭合符号）'],
       [/Unexpected token/, '意外的标记'],
@@ -266,7 +246,7 @@ function BotConfigPageContent() {
 
     return firstLine
   }
-  
+
   /**
    * 解析并设置所有配置状态
    * 抽取自 loadConfig 和 handleModeChange 中的重复逻辑
@@ -275,106 +255,43 @@ function BotConfigPageContent() {
     const { memory: _legacyMemory, ...configWithoutLegacyMemory } = config
     configRef.current = configWithoutLegacyMemory
 
-    setBotConfig((config.bot ?? {}) as ConfigSectionData)
-    setPersonalityConfig((config.personality ?? {}) as ConfigSectionData)
-    setChatConfig((config.chat ?? {}) as ConfigSectionData)
-    setExpressionConfig((config.expression ?? {}) as ConfigSectionData)
-    setJargonConfig((config.jargon ?? {}) as ConfigSectionData)
-    setEmojiConfig((config.emoji ?? {}) as ConfigSectionData)
-    setVisualConfig((config.visual ?? {}) as ConfigSectionData)
-    setVoiceConfig((config.voice ?? {}) as ConfigSectionData)
-    setMessageReceiveConfig((config.message_receive ?? {}) as ConfigSectionData)
-    setKeywordReactionConfig((config.keyword_reaction ?? {}) as ConfigSectionData)
-    setResponsePostProcessConfig((config.response_post_process ?? {}) as ConfigSectionData)
-    setChineseTypoConfig((config.chinese_typo ?? {}) as ConfigSectionData)
-    setResponseSplitterConfig((config.response_splitter ?? {}) as ConfigSectionData)
-    setLogConfig((config.log ?? {}) as ConfigSectionData)
-    setDebugConfig((config.debug ?? {}) as ConfigSectionData)
-    setMaimMessageConfig((config.maim_message ?? {}) as ConfigSectionData)
-    setTelemetryConfig((config.telemetry ?? {}) as ConfigSectionData)
-    setWebuiConfig((config.webui ?? {}) as ConfigSectionData)
-    setDatabaseConfig((config.database ?? {}) as ConfigSectionData)
-    setMcpConfig((config.mcp ?? {}) as ConfigSectionData)
-    setPluginRuntimeConfig((config.plugin_runtime ?? {}) as ConfigSectionData)
-    setAMemorixConfig((config.a_memorix ?? {}) as ConfigSectionData)
+    setSectionValues(
+      Object.fromEntries(
+        Object.entries(configWithoutLegacyMemory).map(([sectionName, sectionValue]) => [
+          sectionName,
+          (sectionValue ?? {}) as ConfigSectionData,
+        ])
+      )
+    )
   }, [])
 
   /**
    * 构建完整的配置对象用于保存
-   * 抽取自 saveConfig 和 handleSaveAndRestart 中的重复逻辑
    */
   const buildFullConfig = useCallback(() => {
+    const cleanSectionValues = Object.fromEntries(
+      Object.entries(sectionValues).filter(([, value]) => value !== null)
+    )
+
     return {
       ...configRef.current,
-      bot: botConfig,
-      personality: personalityConfig,
-      chat: chatConfig,
-      expression: expressionConfig,
-      jargon: jargonConfig,
-      emoji: emojiConfig,
-      visual: visualConfig,
-      voice: voiceConfig,
-      message_receive: messageReceiveConfig,
-      keyword_reaction: keywordReactionConfig,
-      response_post_process: responsePostProcessConfig,
-      chinese_typo: chineseTypoConfig,
-      response_splitter: responseSplitterConfig,
-      log: logConfig,
-      debug: debugConfig,
-      maim_message: maimMessageConfig,
-      telemetry: telemetryConfig,
-      webui: webuiConfig,
-      database: databaseConfig,
-      mcp: mcpConfig,
-      plugin_runtime: pluginRuntimeConfig,
-      a_memorix: aMemorixConfig,
+      ...cleanSectionValues,
     }
-  }, [
-    botConfig,
-    personalityConfig,
-    chatConfig,
-    expressionConfig,
-    jargonConfig,
-    emojiConfig,
-    visualConfig,
-    voiceConfig,
-    messageReceiveConfig,
-    keywordReactionConfig,
-    responsePostProcessConfig,
-    chineseTypoConfig,
-    responseSplitterConfig,
-    logConfig,
-    debugConfig,
-    maimMessageConfig,
-    telemetryConfig,
-    webuiConfig,
-    databaseConfig,
-    mcpConfig,
-    pluginRuntimeConfig,
-    aMemorixConfig,
-  ])
+  }, [sectionValues])
 
   // 加载源代码
   const loadSourceCode = useCallback(async () => {
     try {
       const result = await getBotConfigRaw()
-      if (!result.success) {
-        toast({
-          variant: 'destructive',
-          title: '加载失败',
-          description: result.error,
-        })
-        return
-      }
-      const raw = (result.data as unknown as Record<string, unknown>).content as string
+      const raw = (result as unknown as Record<string, unknown>).content as string
       // 将 TOML 基本字符串中的转义序列转换为实际字符以便在编辑器中正确显示
       // 使用正则表达式只处理双引号字符串内的转义序列，不影响单引号字符串
       const unescaped = raw.replace(/"([^"]*)"/g, (_match, content) => {
         const decoded = content
-          .replace(/\\n/g, '\n')  // 换行符
-          .replace(/\\t/g, '\t')  // 制表符
-          .replace(/\\r/g, '\r')  // 回车符
-          .replace(/\\"/g, '"')   // 双引号
+          .replace(/\\n/g, '\n') // 换行符
+          .replace(/\\t/g, '\t') // 制表符
+          .replace(/\\r/g, '\r') // 回车符
+          .replace(/\\"/g, '"') // 双引号
           .replace(/\\\\/g, '\\') // 反斜杠（必须放在最后）
         return `"${decoded}"`
       })
@@ -393,19 +310,25 @@ function BotConfigPageContent() {
   const loadConfig = useCallback(async () => {
     try {
       setLoading(true)
-      const [result, schemaResult] = await Promise.all([getBotConfigCached(), getBotConfigSchema()])
-      if (!result.success) {
+      // 用 allSettled：主配置为必需，schema 为可选，二者失败互不影响
+      const [result, schemaResult] = await Promise.allSettled([
+        getBotConfigCached(),
+        getBotConfigSchema(),
+      ])
+      if (result.status !== 'fulfilled') {
         toast({
           title: '加载失败',
-          description: result.error,
+          description: result.reason instanceof Error ? result.reason.message : '加载配置失败',
           variant: 'destructive',
         })
         setLoading(false)
         return
       }
-      parseAndSetConfig((result.data as Record<string, unknown>).config as Record<string, unknown>)
-      if (schemaResult.success && schemaResult.data) {
-        setConfigSchema((schemaResult.data as unknown as Record<string, unknown>).schema as ConfigSchema)
+      parseAndSetConfig(result.value)
+      if (schemaResult.status === 'fulfilled' && schemaResult.value) {
+        setConfigSchema(
+          (schemaResult.value as unknown as Record<string, unknown>).schema as ConfigSchema
+        )
       }
       setHasUnsavedChanges(false)
       initialLoadRef.current = false
@@ -432,12 +355,23 @@ function BotConfigPageContent() {
       ['bot.qq_account', HiddenFieldHook, 'hidden'],
       ['bot.platforms', HiddenFieldHook, 'hidden'],
       ['personality.multiple_reply_style', MultipleReplyStyleHook],
-      ['chat.chat_prompts', ChatPromptsHook],
-      ['chat.talk_value_rules', ChatTalkValueRulesHook],
+      ['chat.reply_style.chat_prompts', ChatPromptsHook],
+      ['chat.reply_timing.talk_value_rules', ChatTalkValueRulesHook],
+      ['experimental.focus_chat_whitelist', FocusWhitelistHook],
+      ['experimental.focus_groups', BehaviorFocusGroupsHook],
+      ['experimental.behavior_groups', BehaviorGroupsHook],
+      ['experimental.behavior_learning_list', BehaviorLearningListHook],
       ['expression.expression_groups', ExpressionGroupsHook],
       ['expression.learning_list', ExpressionLearningListHook],
       ['jargon.jargon_groups', JargonGroupsHook],
       ['jargon.learning_list', JargonLearningListHook],
+      ['a_memorix.shared_memory_groups', AMemorixSharedMemoryGroupsHook],
+      ['a_memorix.integration', AMemorixRetrievalFilterMirrorHook, 'wrapper'],
+      ['a_memorix.retrieval', AMemorixRetrievalFilterMirrorHook, 'wrapper'],
+      ['a_memorix.episode', AMemorixRetrievalFilterMirrorHook, 'wrapper'],
+      ['a_memorix.filter.retrieval.chat_stream.chats', AMemorixRetrievalChatsHook],
+      ['a_memorix.filter.retrieval.chat_summary.chats', AMemorixRetrievalChatsHook],
+      ['a_memorix.filter.retrieval.episode.chats', AMemorixRetrievalChatsHook],
       ['keyword_reaction.keyword_rules', KeywordRulesHook],
       ['keyword_reaction.regex_rules', RegexRulesHook],
       ['mcp.client.roots.items', MCPRootItemsHook],
@@ -455,38 +389,16 @@ function BotConfigPageContent() {
     }
   }, [])
 
-  // 使用模块化的 useAutoSave hook
   const { triggerAutoSave, cancelPendingAutoSave } = useAutoSave(
     initialLoadRef.current,
     setAutoSaving,
     setHasUnsavedChanges
   )
 
-  // 使用 useConfigAutoSave hook 简化配置变化监听
-  // 注意: useConfigAutoSave 是一个 hook，不能在条件语句或循环中调用
-  // 因此我们仍然需要逐个调用，但代码更简洁
-  useConfigAutoSave(botConfig, 'bot', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(personalityConfig, 'personality', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(chatConfig, 'chat', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(expressionConfig, 'expression', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(jargonConfig, 'jargon', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(emojiConfig, 'emoji', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(visualConfig, 'visual', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(voiceConfig, 'voice', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(messageReceiveConfig, 'message_receive', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(keywordReactionConfig, 'keyword_reaction', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(responsePostProcessConfig, 'response_post_process', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(chineseTypoConfig, 'chinese_typo', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(responseSplitterConfig, 'response_splitter', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(logConfig, 'log', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(debugConfig, 'debug', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(maimMessageConfig, 'maim_message', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(telemetryConfig, 'telemetry', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(webuiConfig, 'webui', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(databaseConfig, 'database', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(mcpConfig, 'mcp', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(pluginRuntimeConfig, 'plugin_runtime', initialLoadRef.current, triggerAutoSave)
-  useConfigAutoSave(aMemorixConfig, 'a_memorix', initialLoadRef.current, triggerAutoSave)
+  const dismissFileModeNotice = useCallback(() => {
+    localStorage.setItem(FILE_MODE_NOTICE_DISMISSED_KEY, 'true')
+    setShowFileModeNotice(false)
+  }, [])
 
   // 保存源代码
   const saveSourceCode = async () => {
@@ -502,7 +414,7 @@ function BotConfigPageContent() {
           .replace(/\r/g, '\\r')
         return `"${encoded}"`
       })
-      
+
       // 前端验证 TOML 格式
       try {
         parseToml(escapedSourceCode)
@@ -519,19 +431,8 @@ function BotConfigPageContent() {
         setSaving(false)
         return
       }
-      
-      const result = await updateBotConfigRaw(escapedSourceCode)
-      if (!result.success) {
-        setHasTomlError(true)
-        const errorMsg = result.error
-        setTomlErrorMessage(errorMsg)
-        toast({
-          variant: 'destructive',
-          title: '保存失败',
-          description: errorMsg,
-        })
-        return
-      }
+
+      await updateBotConfigRaw(escapedSourceCode)
       setHasUnsavedChanges(false)
       setHasTomlError(false)
       setTomlErrorMessage('')
@@ -573,15 +474,7 @@ function BotConfigPageContent() {
       // 切换回可视化时,直接重新加载配置但不显示全局 loading
       try {
         const result = await getBotConfig()
-        if (!result.success) {
-          toast({
-            title: '加载失败',
-            description: result.error,
-            variant: 'destructive',
-          })
-          return
-        }
-        parseAndSetConfig((result.data as Record<string, unknown>).config as Record<string, unknown>)
+        parseAndSetConfig(result)
         setHasUnsavedChanges(false)
       } catch (error) {
         console.error('加载配置失败:', error)
@@ -600,17 +493,8 @@ function BotConfigPageContent() {
       setSaving(true)
       // 取消待处理的自动保存
       cancelPendingAutoSave()
-      
-      const result = await updateBotConfig(buildFullConfig())
-      if (!result.success) {
-        toast({
-          title: '保存失败',
-          description: result.error,
-          variant: 'destructive',
-        })
-        setSaving(false)
-        return
-      }
+
+      await updateBotConfig(buildFullConfig())
       setHasUnsavedChanges(false)
       toast({
         title: '保存成功',
@@ -628,16 +512,6 @@ function BotConfigPageContent() {
     }
   }
 
-  // 重启麦麦
-  const handleRestart = async () => {
-    await triggerRestart()
-  }
-
-  const dismissRestartNotice = () => {
-    localStorage.setItem('bot-config-restart-notice-dismissed', 'true')
-    setRestartNoticeVisible(false)
-  }
-
   const handleReloadFromFile = async () => {
     cancelPendingAutoSave()
     await loadConfig()
@@ -651,30 +525,26 @@ function BotConfigPageContent() {
     })
   }
 
+  // 重启麦麦
+  const handleRestart = async () => {
+    await triggerRestart()
+  }
+
   // 保存并重启
   const handleSaveAndRestart = async () => {
     try {
       setSaving(true)
       // 取消待处理的自动保存
       cancelPendingAutoSave()
-      
-      const result = await updateBotConfig(buildFullConfig())
-      if (!result.success) {
-        toast({
-          title: '保存失败',
-          description: result.error,
-          variant: 'destructive',
-        })
-        setSaving(false)
-        return
-      }
+
+      await updateBotConfig(buildFullConfig())
       setHasUnsavedChanges(false)
       toast({
         title: '保存成功',
         description: '配置已保存，即将重启麦麦...',
       })
       // 等待一下让用户看到保存成功的提示
-      await new Promise(resolve => setTimeout(resolve, TOAST_DISPLAY_DELAY))
+      await new Promise((resolve) => setTimeout(resolve, TOAST_DISPLAY_DELAY))
       await handleRestart()
     } catch (error) {
       console.error('保存失败:', error)
@@ -687,6 +557,8 @@ function BotConfigPageContent() {
       setSaving(false)
     }
   }
+  // 保留给后续恢复重启入口或快捷操作复用；当前页面不渲染重启按钮。
+  void handleSaveAndRestart
 
   // 根据 schema 构建 tab 分组
   const tabGroups = useMemo(() => {
@@ -694,91 +566,19 @@ function BotConfigPageContent() {
     return buildTabGroupsFromSchema(configSchema)
   }, [configSchema])
 
-  const sectionValues = useMemo<Record<string, ConfigSectionData | null>>(
-    () => ({
-      bot: botConfig,
-      personality: personalityConfig,
-      chat: chatConfig,
-      expression: expressionConfig,
-      jargon: jargonConfig,
-      emoji: emojiConfig,
-      visual: visualConfig,
-      voice: voiceConfig,
-      message_receive: messageReceiveConfig,
-      keyword_reaction: keywordReactionConfig,
-      response_post_process: responsePostProcessConfig,
-      chinese_typo: chineseTypoConfig,
-      response_splitter: responseSplitterConfig,
-      log: logConfig,
-      debug: debugConfig,
-      maim_message: maimMessageConfig,
-      telemetry: telemetryConfig,
-      webui: webuiConfig,
-      database: databaseConfig,
-      mcp: mcpConfig,
-      plugin_runtime: pluginRuntimeConfig,
-      a_memorix: aMemorixConfig,
-    }),
-    [
-      botConfig,
-      personalityConfig,
-      chatConfig,
-      expressionConfig,
-      jargonConfig,
-      emojiConfig,
-      visualConfig,
-      voiceConfig,
-      messageReceiveConfig,
-      keywordReactionConfig,
-      responsePostProcessConfig,
-      chineseTypoConfig,
-      responseSplitterConfig,
-      logConfig,
-      debugConfig,
-      maimMessageConfig,
-      telemetryConfig,
-      webuiConfig,
-      databaseConfig,
-      mcpConfig,
-      pluginRuntimeConfig,
-      aMemorixConfig,
-    ]
-  )
-
   const setSectionValue = useCallback((sectionName: string, value: ConfigSectionData) => {
-    const sectionSetterMap: Record<string, (nextValue: ConfigSectionData) => void> = {
-      bot: setBotConfig,
-      personality: setPersonalityConfig,
-      chat: setChatConfig,
-      expression: setExpressionConfig,
-      jargon: setJargonConfig,
-      emoji: setEmojiConfig,
-      visual: setVisualConfig,
-      voice: setVoiceConfig,
-      message_receive: setMessageReceiveConfig,
-      keyword_reaction: setKeywordReactionConfig,
-      response_post_process: setResponsePostProcessConfig,
-      chinese_typo: setChineseTypoConfig,
-      response_splitter: setResponseSplitterConfig,
-      log: setLogConfig,
-      debug: setDebugConfig,
-      maim_message: setMaimMessageConfig,
-      telemetry: setTelemetryConfig,
-      webui: setWebuiConfig,
-      database: setDatabaseConfig,
-      mcp: setMcpConfig,
-      plugin_runtime: setPluginRuntimeConfig,
-      a_memorix: setAMemorixConfig,
-    }
-
-    sectionSetterMap[sectionName]?.(value)
-  }, [])
+    setSectionValues((current) => ({
+      ...current,
+      [sectionName]: value,
+    }))
+    triggerAutoSave(sectionName, value)
+  }, [triggerAutoSave])
 
   if (loading) {
     return (
       <ScrollArea className="h-full">
-        <div className="space-y-4 sm:space-y-6 p-4 sm:p-6">
-          <div className="flex items-center justify-center h-64">
+        <div className="space-y-4 p-4 sm:space-y-6 sm:p-6">
+          <div className="flex h-64 items-center justify-center">
             <ThinkingIllustration size="lg" />
           </div>
         </div>
@@ -791,10 +591,9 @@ function BotConfigPageContent() {
       <div className="max-w-full space-y-4 overflow-x-hidden p-4 sm:space-y-6 sm:p-6">
         {/* 页面标题 */}
         <div className="flex flex-col gap-3 sm:gap-4">
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="min-w-0">
-              <h1 className="text-xl sm:text-2xl md:text-3xl font-bold">麦麦设置</h1>
-              <p className="text-muted-foreground mt-1 text-xs sm:text-sm">管理麦麦的核心功能和行为设置</p>
+              <h1 className="text-xl font-bold sm:text-2xl md:text-3xl">麦麦设置</h1>
             </div>
             {/* 按钮组 - 桌面端靠右 */}
             <div className="flex w-full min-w-0 flex-wrap gap-2 sm:w-auto sm:flex-shrink-0 sm:justify-end">
@@ -803,14 +602,14 @@ function BotConfigPageContent() {
                 onValueChange={(v) => handleModeChange(v as 'visual' | 'source')}
                 className="w-full min-w-0 sm:w-[14rem]"
               >
-                <TabsList className="grid h-8 w-full grid-cols-2 sm:h-9">
-                  <TabsTrigger value="visual" className="px-2 text-xs">
-                    <Layout className="mr-1 h-3 w-3 sm:h-4 sm:w-4" />
+                <TabsList data-config-bot-mode-tabs="true" className="grid h-9 w-full grid-cols-2">
+                  <TabsTrigger value="visual" className="px-2 text-sm">
+                    <Layout className="mr-1 h-4 w-4" />
                     可视化
                   </TabsTrigger>
-                  <TabsTrigger value="source" className="px-2 text-xs">
-                    <Code2 className="mr-1 h-3 w-3 sm:h-4 sm:w-4" />
-                    源代码
+                  <TabsTrigger value="source" className="px-2 text-sm">
+                    <Code2 className="mr-1 h-4 w-4" />
+                    文件
                   </TabsTrigger>
                 </TabsList>
               </Tabs>
@@ -819,95 +618,89 @@ function BotConfigPageContent() {
                 disabled={saving || autoSaving || isRestarting}
                 size="sm"
                 variant="outline"
-                className="min-w-0 flex-1 sm:w-24 sm:flex-none"
+                className="h-9 w-9 flex-none px-0"
+                aria-label="刷新"
+                title="刷新"
               >
-                <RefreshCw className="h-3 w-3 sm:h-4 sm:w-4 mr-1" />
-                刷新
+                <RefreshCw className="h-4 w-4" />
               </Button>
               <Button
                 onClick={editMode === 'visual' ? saveConfig : saveSourceCode}
                 disabled={saving || autoSaving || !hasUnsavedChanges || isRestarting}
                 size="sm"
                 variant="outline"
-                className="min-w-0 flex-1 sm:w-24 sm:flex-none"
+                className="h-9 w-9 flex-none px-0"
+                aria-label={
+                  saving
+                    ? '保存中'
+                    : autoSaving
+                      ? '自动保存中'
+                      : hasUnsavedChanges
+                        ? '保存'
+                        : '已保存'
+                }
+                title={
+                  saving
+                    ? '保存中'
+                    : autoSaving
+                      ? '自动保存中'
+                      : hasUnsavedChanges
+                        ? '保存'
+                        : '已保存'
+                }
               >
-                <Save className="h-4 w-4 flex-shrink-0" strokeWidth={2} fill="none" />
-                <span className="ml-1 truncate text-xs sm:text-sm">
-                  {saving ? '保存中' : autoSaving ? '自动' : hasUnsavedChanges ? '保存' : '已保存'}
+                <span className="relative inline-flex h-4 w-4 items-center justify-center">
+                  <Save className="h-4 w-4" strokeWidth={2} fill="none" />
+                  {!saving && !autoSaving && !hasUnsavedChanges && (
+                    <Check
+                      className="pointer-events-none absolute -right-2 -bottom-2 !h-3 !w-3"
+                      strokeWidth={3.4}
+                    />
+                  )}
                 </span>
               </Button>
-              <AlertDialog>
-                <AlertDialogTrigger asChild>
-                  <Button
-                    disabled={saving || autoSaving || isRestarting}
-                    size="sm"
-                    className="min-w-0 flex-1 sm:w-28 sm:flex-none"
-                  >
-                    <Power className="h-4 w-4 flex-shrink-0" />
-                    <span className="ml-1 truncate text-xs sm:text-sm">
-                      {isRestarting ? '重启中' : hasUnsavedChanges ? '保存重启' : '重启'}
-                    </span>
-                  </Button>
-                </AlertDialogTrigger>
-                <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>确认重启麦麦？</AlertDialogTitle>
-                  <AlertDialogDescription asChild>
-                    <div>
-                      <p>
-                        {hasUnsavedChanges 
-                          ? '当前有未保存的配置更改。点击确认将先保存配置,然后重启麦麦使新配置生效。重启过程中麦麦将暂时离线。'
-                          : '即将重启麦麦主程序。重启过程中麦麦将暂时离线,配置将在重启后生效。'
-                        }
-                      </p>
-                    </div>
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>取消</AlertDialogCancel>
-                  <AlertDialogAction onClick={hasUnsavedChanges ? handleSaveAndRestart : handleRestart}>
-                    {hasUnsavedChanges ? '保存并重启' : '确认重启'}
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
             </div>
           </div>
         </div>
 
-        {/* 重启提示 */}
-        {restartNoticeVisible && (
-          <Alert>
-            <Info className="h-4 w-4" />
-            <AlertDescription className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <span>
-                配置更新后需要<strong>重启麦麦</strong>才能生效。你可以点击右上角的"保存并重启"按钮一键完成保存和重启。
-              </span>
-              <Button type="button" variant="outline" size="sm" onClick={dismissRestartNotice}>
-                我知道了
-              </Button>
-            </AlertDescription>
-          </Alert>
-        )}
-
         {/* 源代码模式 */}
         {editMode === 'source' && (
           <div className="space-y-4">
-            <Alert>
-              <Info className="h-4 w-4" />
-              <AlertDescription>
-                <strong>源代码模式（高级功能）：</strong>直接编辑 TOML 配置文件。此功能仅适用于熟悉 TOML 语法的高级用户。保存时会在前端验证格式，只有格式完全正确才能保存。
-                {hasTomlError && tomlErrorMessage && (
-                  <div className="text-destructive font-semibold mt-3 p-3 bg-destructive/10 rounded-md">
-                    <div className="font-bold mb-2">⚠️ TOML 格式错误：</div>
-                    <pre className="text-sm font-mono whitespace-pre-wrap break-words">
-                      {tomlErrorMessage}
-                    </pre>
-                  </div>
+            {(showFileModeNotice || (hasTomlError && tomlErrorMessage)) && (
+              <Alert className={showFileModeNotice ? 'pr-10' : undefined}>
+                <Info className="h-4 w-4" />
+                {showFileModeNotice && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="absolute top-2 right-2 h-6 w-6 px-0"
+                    aria-label="关闭文件模式提示"
+                    title="关闭文件模式提示"
+                    onClick={dismissFileModeNotice}
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </Button>
                 )}
-              </AlertDescription>
-            </Alert>
-            
+                <AlertDescription>
+                  {showFileModeNotice && (
+                    <>
+                      <strong>文件模式：</strong>直接编辑原始配置文件。此功能仅适用于熟悉 TOML
+                      语法的用户。只有格式完全正确才能保存。
+                    </>
+                  )}
+                  {hasTomlError && tomlErrorMessage && (
+                    <div className="text-destructive bg-destructive/10 mt-3 rounded-md p-3 font-semibold">
+                      <div className="mb-2 font-bold">⚠️ TOML 格式错误：</div>
+                      <pre className="font-mono text-sm break-words whitespace-pre-wrap">
+                        {tomlErrorMessage}
+                      </pre>
+                    </div>
+                  )}
+                </AlertDescription>
+              </Alert>
+            )}
+
             <CodeEditor
               value={sourceCode}
               onChange={(value) => {
@@ -968,7 +761,11 @@ function updateNestedValue(
 
   return {
     ...currentTarget,
-    [currentPath]: updateNestedValue(currentTarget[currentPath] as ConfigSectionData | undefined, restPath, value),
+    [currentPath]: updateNestedValue(
+      currentTarget[currentPath] as ConfigSectionData | undefined,
+      restPath,
+      value
+    ),
   }
 }
 
@@ -984,7 +781,12 @@ function DynamicConfigTabs(props: DynamicConfigTabsProps) {
   const { configSchema, sectionValues, setHasUnsavedChanges, setSectionValue, tabGroups } = props
   const [expanded, setExpanded] = useState(false)
   const [activeTab, setActiveTab] = useState(tabGroups[0]?.id ?? '')
+  const [expandedSubtabGroups, setExpandedSubtabGroups] = useState<Record<string, boolean>>({})
+  const [activeSubtabByGroup, setActiveSubtabByGroup] = useState<Record<string, string>>({})
   const [advancedVisible, setAdvancedVisible] = useState(false)
+  const [tabGuideVisible, setTabGuideVisible] = useState(
+    () => localStorage.getItem('bot-config-tabs-guide-dismissed') !== 'true'
+  )
 
   useEffect(() => {
     if (!tabGroups.some((tab) => tab.id === activeTab)) {
@@ -996,22 +798,271 @@ function DynamicConfigTabs(props: DynamicConfigTabsProps) {
     return null
   }
 
-  const visibleTabGroups = expanded
-    ? tabGroups
-    : tabGroups.filter((tab) => DEFAULT_VISIBLE_TAB_IDS.has(tab.id))
-  const hasCollapsibleTabs = tabGroups.some((tab) => !DEFAULT_VISIBLE_TAB_IDS.has(tab.id))
-  const firstExpandedTabId = visibleTabGroups.find(
-    (tab) => !DEFAULT_VISIBLE_TAB_IDS.has(tab.id)
-  )?.id
+  const defaultTabGroups = tabGroups.filter((tab) => !tab.advanced)
+  const expandedTabGroups = tabGroups.filter((tab) => tab.advanced)
+  const visibleTabGroups = expanded ? [...defaultTabGroups, ...expandedTabGroups] : defaultTabGroups
+  const hasCollapsibleTabs = tabGroups.some((tab) => tab.advanced)
+  const firstExpandedTabId = visibleTabGroups.find((tab) => tab.advanced)?.id
 
   const toggleExpanded = () => {
     setExpanded((current) => {
-      if (current && !DEFAULT_VISIBLE_TAB_IDS.has(activeTab)) {
-        const firstDefaultTab = tabGroups.find((tab) => DEFAULT_VISIBLE_TAB_IDS.has(tab.id))
+      if (current && tabGroups.find((tab) => tab.id === activeTab)?.advanced) {
+        const firstDefaultTab = tabGroups.find((tab) => !tab.advanced)
         setActiveTab(firstDefaultTab?.id ?? tabGroups[0]?.id ?? '')
       }
       return !current
     })
+  }
+
+  const dismissTabGuide = () => {
+    localStorage.setItem('bot-config-tabs-guide-dismissed', 'true')
+    setTabGuideVisible(false)
+  }
+
+  const updateSectionValueByPath = (sectionName: string, restPath: string[], value: unknown) => {
+    const currentSectionValue = sectionValues[sectionName] ?? {}
+    const nextSectionValue =
+      restPath.length === 0
+        ? (value as ConfigSectionData)
+        : updateNestedValue(currentSectionValue, restPath, value)
+
+    setSectionValue(sectionName, nextSectionValue)
+    setHasUnsavedChanges(true)
+  }
+
+  const getSubtabLabel = (schema: ConfigSchema, fallback: string) => {
+    return schema.uiSubLabel || schema.uiLabel || schema.classDoc || fallback
+  }
+
+  const getObjectSubcategoryEntries = (sectionSchema: ConfigSchema) => {
+    const sectionFieldByName = new Map(sectionSchema.fields.map((field) => [field.name, field]))
+    return Object.entries(sectionSchema.nested ?? {}).filter(([subcategoryName]) => {
+      return sectionFieldByName.get(subcategoryName)?.type === 'object'
+    })
+  }
+
+  const renderSubtabbedContent = (tabId: string, tabNestedEntries: readonly (readonly [string, ConfigSchema])[]) => {
+    const subtabPanes: SubtabPane[] = []
+    const chatManagementHintPaneIds = new Set(['chat.reply_timing', 'chat.reply_style'])
+    const entryMap = new Map<string, ConfigSchema>(
+      tabNestedEntries.map(([sectionName, schema]) => [sectionName, schema]),
+    )
+    const childSectionsByParent = new Map<string, Array<readonly [string, ConfigSchema]>>()
+
+    for (const [sectionName, sectionSchema] of tabNestedEntries) {
+      const parentName = sectionSchema.uiParent
+      if (!parentName || !entryMap.has(parentName)) {
+        continue
+      }
+
+      const childSections = childSectionsByParent.get(parentName) ?? []
+      childSections.push([sectionName, sectionSchema])
+      childSectionsByParent.set(parentName, childSections)
+    }
+
+    const collectDescendantEntries = (parentName: string): Array<readonly [string, ConfigSchema]> => {
+      const directChildEntries = childSectionsByParent.get(parentName) ?? []
+
+      return directChildEntries.flatMap(([childName, childSchema]) => {
+        return [[childName, childSchema] as const, ...collectDescendantEntries(childName)]
+      })
+    }
+
+    const renderSectionGroupContent = (sectionEntries: Array<readonly [string, ConfigSchema]>) => {
+      const values = Object.fromEntries(
+        sectionEntries.map(([sectionName]) => [sectionName, sectionValues[sectionName] ?? {}])
+      )
+      const groupSchema: ConfigSchema = {
+        className: sectionEntries.map(([sectionName]) => sectionName).join('.'),
+        classDoc: sectionEntries[0]?.[1].uiLabel || sectionEntries[0]?.[1].classDoc || '',
+        fields: [],
+        nested: Object.fromEntries(sectionEntries),
+      }
+
+      return (
+        <DynamicConfigForm
+          schema={groupSchema}
+          values={values}
+          onChange={(fieldPath, value) => {
+            const [sectionName, ...restPath] = fieldPath.split('.')
+            if (!sectionName) {
+              return
+            }
+
+            updateSectionValueByPath(sectionName, restPath, value)
+          }}
+          hooks={fieldHooks}
+          advancedVisible={advancedVisible}
+          sectionColumns={2}
+        />
+      )
+    }
+
+    for (const [sectionName, sectionSchema] of tabNestedEntries) {
+      if (sectionSchema.uiParent && entryMap.has(sectionSchema.uiParent)) {
+        continue
+      }
+
+      const sectionValue = (sectionValues[sectionName] ?? {}) as ConfigSectionData
+      const allSubcategoryEntries = sectionSchema.uiUseSubTabs ? getObjectSubcategoryEntries(sectionSchema) : []
+      const subcategoryEntries = allSubcategoryEntries
+      const subcategoryNames = new Set(allSubcategoryEntries.map(([subcategoryName]) => subcategoryName))
+      const rootFields = sectionSchema.fields.filter((field) => !subcategoryNames.has(field.name))
+      const rootSchema: ConfigSchema = {
+        ...sectionSchema,
+        className: `${sectionSchema.className}Root`,
+        fields: rootFields,
+        nested: {},
+      }
+
+      if (rootFields.length > 0) {
+        subtabPanes.push({
+          advanced: Boolean(sectionSchema.uiAdvanced),
+          id: sectionName,
+          label: sectionSchema.uiRootSubLabel || getSubtabLabel(sectionSchema, sectionName),
+          content: (
+            <DynamicConfigForm
+              schema={rootSchema}
+              values={sectionValue}
+              onChange={(fieldPath, value) => updateSectionValueByPath(sectionName, fieldPath.split('.'), value)}
+              basePath={sectionName}
+              hooks={fieldHooks}
+              advancedVisible={advancedVisible}
+              sectionColumns={1}
+            />
+          ),
+        })
+      }
+
+      for (const [subcategoryName, subcategorySchema] of subcategoryEntries) {
+        subtabPanes.push({
+          advanced: Boolean(subcategorySchema.uiAdvanced),
+          id: `${sectionName}.${subcategoryName}`,
+          label: getSubtabLabel(subcategorySchema, subcategoryName),
+          content: (
+            <DynamicConfigForm
+              schema={subcategorySchema}
+              values={(sectionValue[subcategoryName] as Record<string, unknown>) || {}}
+              onChange={(fieldPath, value) =>
+                updateSectionValueByPath(sectionName, [subcategoryName, ...fieldPath.split('.')], value)
+              }
+              basePath={`${sectionName}.${subcategoryName}`}
+              hooks={fieldHooks}
+              advancedVisible={advancedVisible}
+              sectionColumns={1}
+            />
+          ),
+        })
+      }
+
+      for (const [childName, childSchema] of childSectionsByParent.get(sectionName) ?? []) {
+        const sectionGroupEntries = [[childName, childSchema] as const, ...collectDescendantEntries(childName)]
+        subtabPanes.push({
+          advanced: Boolean(childSchema.uiAdvanced),
+          id: childName,
+          label: getSubtabLabel(childSchema, childName),
+          content: renderSectionGroupContent(sectionGroupEntries),
+        })
+      }
+    }
+
+    if (subtabPanes.length === 0) {
+      return null
+    }
+
+    const subtabExpanded = Boolean(expandedSubtabGroups[tabId])
+    const defaultSubtabPanes = subtabPanes.filter((pane) => !pane.advanced)
+    const expandedSubtabPanes = subtabPanes.filter((pane) => pane.advanced)
+    const visibleSubtabPanes = subtabExpanded ? [...defaultSubtabPanes, ...expandedSubtabPanes] : defaultSubtabPanes
+    const hasCollapsibleSubtabs = subtabPanes.some((pane) => pane.advanced)
+    const firstExpandedSubtabId = visibleSubtabPanes.find((pane) => pane.advanced)?.id
+    const visibleSubtabIds = new Set(visibleSubtabPanes.map((pane) => pane.id))
+    const activeSubtab = activeSubtabByGroup[tabId]
+    const resolvedActiveSubtab = visibleSubtabIds.has(activeSubtab)
+      ? activeSubtab
+      : visibleSubtabPanes[0]?.id ?? subtabPanes[0].id
+
+    const toggleSubtabsExpanded = () => {
+      if (subtabExpanded && subtabPanes.find((pane) => pane.id === resolvedActiveSubtab)?.advanced) {
+        setActiveSubtabByGroup((current) => ({
+          ...current,
+          [tabId]: defaultSubtabPanes[0]?.id ?? subtabPanes[0].id,
+        }))
+      }
+
+      setExpandedSubtabGroups((current) => ({
+        ...current,
+        [tabId]: !subtabExpanded,
+      }))
+    }
+
+    return (
+      <Tabs
+        key={subtabPanes.map((pane) => pane.id).join('|')}
+        value={resolvedActiveSubtab}
+        onValueChange={(value) =>
+          setActiveSubtabByGroup((current) => ({
+            ...current,
+            [tabId]: value,
+          }))
+        }
+        className="space-y-3"
+      >
+        <DashboardTabBar data-config-bot-subtab-list="true" variant="scroll" className="bg-background/80 h-11 border">
+          {visibleSubtabPanes.map((pane) => (
+            <Fragment key={pane.id}>
+              {pane.id === firstExpandedSubtabId && (
+                <span className="bg-border/90 mx-1 hidden h-7 w-[2px] transition-opacity duration-200 sm:block" />
+              )}
+              <DashboardTabTrigger
+                value={pane.id}
+                data-config-bot-extra-tab={pane.advanced ? 'true' : undefined}
+                className={cn(
+                  'min-h-8 text-base font-semibold',
+                  pane.advanced &&
+                    'text-muted-foreground/80 decoration-border/80 hover:bg-background/70 data-[state=active]:bg-primary/10 data-[state=active]:text-primary underline decoration-dashed underline-offset-4 data-[state=active]:shadow-none motion-safe:animate-[config-tab-enter_180ms_ease-out_both]'
+                )}
+              >
+                {pane.label}
+              </DashboardTabTrigger>
+            </Fragment>
+          ))}
+          {hasCollapsibleSubtabs && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="group h-8 shrink-0 gap-1 self-center px-2 text-sm leading-none transition-all duration-200 ease-out sm:px-2.5"
+              onClick={toggleSubtabsExpanded}
+            >
+              {subtabExpanded ? (
+                <ChevronLeft className="h-3.5 w-3.5 transition-transform duration-200 group-hover:-translate-x-0.5" />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5 transition-transform duration-200 group-hover:translate-x-0.5" />
+              )}
+              {subtabExpanded ? '收起' : '更多'}
+            </Button>
+          )}
+        </DashboardTabBar>
+
+        {visibleSubtabPanes.map((pane) => (
+          <TabsContent key={pane.id} value={pane.id} className="mt-0">
+            {chatManagementHintPaneIds.has(pane.id) && (
+              <div className="mb-3 flex flex-col gap-2 rounded-md border bg-muted/20 px-3 py-2 text-sm text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
+                <span>需要按具体聊天流调整发言频率或查看聊天 Prompt 时，可以前往聊天管理。</span>
+                <Button asChild size="sm" variant="outline" className="h-8 shrink-0 self-start sm:self-center">
+                  <Link to="/chat-management">
+                    <ExternalLink className="mr-2 h-3.5 w-3.5" />
+                    聊天管理
+                  </Link>
+                </Button>
+              </div>
+            )}
+            {pane.content}
+          </TabsContent>
+        ))}
+      </Tabs>
+    )
   }
 
   const renderTabContent = (tab: TabGroup) => {
@@ -1021,6 +1072,10 @@ function DynamicConfigTabs(props: DynamicConfigTabsProps) {
 
     if (tabNestedEntries.length === 0) {
       return null
+    }
+
+    if (tabNestedEntries.some(([, sectionSchema]) => sectionSchema.uiUseSubTabs)) {
+      return renderSubtabbedContent(tab.id, tabNestedEntries)
     }
 
     const values = Object.fromEntries(
@@ -1044,14 +1099,7 @@ function DynamicConfigTabs(props: DynamicConfigTabsProps) {
             return
           }
 
-          const currentSectionValue = sectionValues[sectionName] ?? {}
-          const nextSectionValue =
-            restPath.length === 0
-              ? (value as ConfigSectionData)
-              : updateNestedValue(currentSectionValue, restPath, value)
-
-          setSectionValue(sectionName, nextSectionValue)
-          setHasUnsavedChanges(true)
+          updateSectionValueByPath(sectionName, restPath, value)
         }}
         hooks={fieldHooks}
         advancedVisible={advancedVisible}
@@ -1062,57 +1110,77 @@ function DynamicConfigTabs(props: DynamicConfigTabsProps) {
 
   return (
     <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-      <div className="-mx-4 overflow-x-auto px-4 pb-1 sm:mx-0 sm:overflow-x-visible sm:px-0 sm:pb-0">
-        <TabsList className="flex h-auto w-max min-w-full flex-nowrap justify-start gap-1 p-1 transition-all duration-300 ease-out sm:w-full sm:flex-wrap">
-          {visibleTabGroups.map((tab) => {
-            const isExpandedOnlyTab = !DEFAULT_VISIBLE_TAB_IDS.has(tab.id)
-            return (
-              <Fragment key={tab.id}>
-                {tab.id === firstExpandedTabId && (
-                  <span className="mx-1 hidden h-6 w-px bg-border/80 transition-opacity duration-200 sm:block" />
-                )}
-                <TabsTrigger
-                  value={tab.id}
-                  className={cn(
-                    "shrink-0 px-2 py-1.5 text-sm transition-all duration-200 ease-out sm:px-3 sm:py-2 data-[state=active]:shadow-sm",
-                    isExpandedOnlyTab &&
-                      "border border-dashed border-border/70 bg-background/45 text-muted-foreground/80 motion-safe:animate-[config-tab-enter_180ms_ease-out_both] hover:bg-background/70 data-[state=active]:border-primary/45 data-[state=active]:bg-primary/10 data-[state=active]:text-primary data-[state=active]:shadow-none"
-                  )}
-                >
-                  {tab.label}
-                </TabsTrigger>
-              </Fragment>
-            )
-          })}
-          {hasCollapsibleTabs && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="group h-8 shrink-0 px-2 text-xs transition-all duration-200 ease-out sm:h-9 sm:px-3"
-              onClick={toggleExpanded}
-            >
-              {expanded ? (
-                <ChevronLeft className="mr-1 h-3.5 w-3.5 transition-transform duration-200 group-hover:-translate-x-0.5" />
-              ) : (
-                <ChevronRight className="mr-1 h-3.5 w-3.5 transition-transform duration-200 group-hover:translate-x-0.5" />
+      <DashboardTabBar
+        data-config-bot-tab-list="true"
+        className="h-auto min-h-[3.25rem] content-start items-stretch sm:flex-wrap"
+      >
+        {visibleTabGroups.map((tab) => {
+          const isExpandedOnlyTab = tab.advanced
+          return (
+            <Fragment key={tab.id}>
+              {tab.id === firstExpandedTabId && (
+                <span className="bg-border/90 mx-1 hidden h-7 w-[2px] transition-opacity duration-200 sm:block" />
               )}
-              {expanded ? '收起' : '更多'}
-            </Button>
-          )}
+              <DashboardTabTrigger
+                value={tab.id}
+                data-config-bot-extra-tab={isExpandedOnlyTab ? 'true' : undefined}
+                className={cn(
+                  'min-h-9 text-lg font-semibold',
+                  isExpandedOnlyTab &&
+                    'text-muted-foreground/80 decoration-border/80 hover:bg-background/70 data-[state=active]:bg-primary/10 data-[state=active]:text-primary underline decoration-dashed underline-offset-4 data-[state=active]:shadow-none motion-safe:animate-[config-tab-enter_180ms_ease-out_both]'
+                )}
+              >
+                {tab.label}
+              </DashboardTabTrigger>
+            </Fragment>
+          )
+        })}
+        {hasCollapsibleTabs && (
           <Button
             type="button"
-            variant={advancedVisible ? 'default' : 'outline'}
+            variant="ghost"
             size="sm"
-            className="h-8 shrink-0 px-2 text-xs transition-all duration-200 ease-out sm:ml-auto sm:h-9 sm:px-3"
-            onClick={() => setAdvancedVisible((current) => !current)}
+            className="group h-9 shrink-0 gap-1 self-center px-2 text-sm leading-none transition-all duration-200 ease-out sm:px-2.5"
+            onClick={toggleExpanded}
           >
-            高级设置
+            {expanded ? (
+              <ChevronLeft className="h-3.5 w-3.5 transition-transform duration-200 group-hover:-translate-x-0.5" />
+            ) : (
+              <ChevronRight className="h-3.5 w-3.5 transition-transform duration-200 group-hover:translate-x-0.5" />
+            )}
+            {expanded ? '收起' : '更多'}
           </Button>
-        </TabsList>
-      </div>
+        )}
+        <Button
+          type="button"
+          variant={advancedVisible ? 'default' : 'outline'}
+          size="sm"
+          className="h-9 shrink-0 self-center px-2.5 text-sm leading-none transition-all duration-200 ease-out sm:ml-auto"
+          onClick={() => setAdvancedVisible((current) => !current)}
+        >
+          高级设置
+        </Button>
+      </DashboardTabBar>
+      {tabGuideVisible && (
+        <div className="bg-muted/20 text-muted-foreground mt-2 flex flex-col gap-2 rounded-md border px-3 py-2 text-xs sm:flex-row sm:items-center sm:justify-between">
+          <span>点击“更多”展开隐藏配置栏目；点击“高级设置”显示高级配置项。</span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-6 self-start px-2 text-xs sm:self-center"
+            onClick={dismissTabGuide}
+          >
+            我知道了
+          </Button>
+        </div>
+      )}
       {tabGroups.map((tab) => (
-        <TabsContent key={tab.id} value={tab.id} className="space-y-4 motion-safe:animate-[config-tab-content-enter_180ms_ease-out_both]">
+        <TabsContent
+          key={tab.id}
+          value={tab.id}
+          className="space-y-4 motion-safe:animate-[config-tab-content-enter_180ms_ease-out_both]"
+        >
           {renderTabContent(tab)}
         </TabsContent>
       ))}

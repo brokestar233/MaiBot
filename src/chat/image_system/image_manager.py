@@ -1,3 +1,6 @@
+﻿import asyncio
+import base64
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -5,14 +8,11 @@ from typing import Dict, Optional
 from rich.traceback import install
 from sqlmodel import select
 
-import asyncio
-import base64
-import hashlib
-
-from src.common.logger import get_logger
+from src.common.data_models.image_data_model import MaiImage
 from src.common.database.database import get_db_session
 from src.common.database.database_model import Images, ImageType
-from src.common.data_models.image_data_model import MaiImage
+from src.common.logger import get_logger
+from src.common.utils.image_path import resolve_stored_image_path, serialize_stored_image_path
 from src.config.config import config_manager
 from src.prompt.prompt_manager import prompt_manager
 from src.services.llm_service import LLMServiceClient
@@ -158,7 +158,9 @@ class ImageManager:
         if image_hash in self._pending_description_tasks:
             return
 
-        task = asyncio.create_task(self._build_description_in_background(image_hash, image_bytes, saved_image=saved_image))
+        task = asyncio.create_task(
+            self._build_description_in_background(image_hash, image_bytes, saved_image=saved_image)
+        )
         self._pending_description_tasks[image_hash] = task
         task.add_done_callback(lambda finished_task: self._finalize_description_build(image_hash, finished_task))
 
@@ -177,9 +179,9 @@ class ImageManager:
             saved_image: 已保存的图片对象，避免重复查询和更新访问计数。
         """
         try:
-            logger.info(f"图片描述后台构建已开始，哈希值: {image_hash}")
+            logger.debug(f"图片描述后台构建已开始，哈希值: {image_hash}")
             await self.build_image_description(image_bytes, saved_image=saved_image)
-            logger.info(f"图片描述后台构建完成，哈希值: {image_hash}")
+            logger.debug(f"图片描述后台构建完成，哈希值: {image_hash}")
         except Exception as exc:
             logger.warning(f"图片描述后台构建失败，哈希值: {image_hash}，错误: {exc}")
 
@@ -198,7 +200,7 @@ class ImageManager:
             return
 
         try:
-            from src.maisaka.chat_history_visual_refresher import log_tracked_image_recognition_completed
+            from src.maisaka.visual.chat_history_refresher import log_tracked_image_recognition_completed
 
             log_tracked_image_recognition_completed(image_hash)
         except Exception as exc:
@@ -317,7 +319,7 @@ class ImageManager:
                 statement = select(Images).filter_by(image_hash=hash_str, image_type=ImageType.IMAGE).limit(1)
                 if record := session.exec(statement).first():
                     self._normalize_image_registration_fields(record)
-                    record_path = Path(record.full_path)
+                    record_path = resolve_stored_image_path(record.full_path)
                     if not record.no_file_flag and record_path.is_file():
                         logger.info(f"图片已存在于数据库中，哈希值: {hash_str}")
                         record.last_used_time = datetime.now()
@@ -330,7 +332,7 @@ class ImageManager:
             logger.error(f"查询图片记录时发生错误: {e}")
             raise e
 
-        logger.info(f"图片不存在或文件缺失，准备保存图片文件，哈希值: {hash_str}")
+        logger.debug(f"图片不存在或文件缺失，准备保存图片文件，哈希值: {hash_str}")
         tmp_file_path = IMAGE_DIR / f"{hash_str}.tmp"
         with tmp_file_path.open("wb") as f:
             f.write(image_bytes)
@@ -355,7 +357,7 @@ class ImageManager:
                     self._normalize_image_registration_fields(record)
                     image.description = record.description
                     image.vlm_processed = record.vlm_processed
-                    record.full_path = str(image.full_path)
+                    record.full_path = serialize_stored_image_path(image.full_path)
 
                 record.no_file_flag = False
                 record.last_used_time = datetime.now()
@@ -418,15 +420,15 @@ class ImageManager:
             with get_db_session() as session:
                 for record in session.exec(select(Images)).yield_per(100):
                     if record.description in invalid_values:
-                        if record.full_path and Path(record.full_path).exists():
+                        if record.full_path and resolve_stored_image_path(record.full_path).exists():
                             try:
-                                Path(record.full_path).unlink()
+                                resolve_stored_image_path(record.full_path).unlink()
                                 logger.info(f"已删除无效描述的图片文件: {record.full_path}")
                             except Exception as e:
                                 logger.error(f"删除无效描述的图片文件时发生错误: {e}")
                         session.delete(record)
                         invalid_counter += 1
-                    elif record.full_path and not Path(record.full_path).exists():
+                    elif record.full_path and not resolve_stored_image_path(record.full_path).exists():
                         session.delete(record)
                         null_path_counter += 1
         except Exception as e:

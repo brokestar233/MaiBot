@@ -104,6 +104,9 @@ class MainSystem:
         logger.info(t("startup.waking_up", nickname=global_config.bot.nickname))
 
         try:
+            from src.services.tool_record_cleanup_service import run_startup_tool_record_vacuum_if_needed
+
+            await asyncio.to_thread(run_startup_tool_record_vacuum_if_needed)
             await self._init_components()
         except Exception:
             if self.webui_server:
@@ -205,7 +208,12 @@ class MainSystem:
         """调度定时任务"""
         try:
             from src.chat.image_system.image_cache_cleanup import periodic_image_cache_cleanup
+            from src.emoji_system.emoji_cache_cleanup import periodic_emoji_cache_cleanup
             from src.emoji_system.emoji_manager import emoji_manager
+            from src.services.image_path_maintenance_service import (
+                run_image_path_maintenance_background,
+                should_schedule_image_path_maintenance_background,
+            )
 
             self._register_message_handlers()
             if self.app is None or self.server is None:
@@ -213,10 +221,14 @@ class MainSystem:
 
             tasks = [
                 emoji_manager.periodic_emoji_maintenance(),
+                periodic_emoji_cache_cleanup(),
                 periodic_image_cache_cleanup(),
                 self.app.run(),
                 self.server.run(),
             ]
+            image_path_maintenance_needed = await asyncio.to_thread(should_schedule_image_path_maintenance_background)
+            if image_path_maintenance_needed:
+                tasks.append(run_image_path_maintenance_background())
 
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:

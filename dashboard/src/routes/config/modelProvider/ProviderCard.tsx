@@ -1,9 +1,9 @@
 import type { TestConnectionResult } from '@/lib/config-api'
-import { AlertCircle, CheckCircle2, Loader2, Pencil, Trash2, XCircle, Zap } from 'lucide-react'
+import { Loader2, Pencil, Trash2, Zap } from 'lucide-react'
 
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 
+import { renderProviderTestStatus } from './providerStatus'
 import type { APIProvider } from './types'
 
 interface ProviderCardProps {
@@ -28,62 +28,20 @@ export function ProviderCard({
   const renderTestStatus = () => {
     const isTesting = testingProviders.has(provider.name)
     const result = testResults.get(provider.name)
-
-    if (isTesting) {
-      return (
-        <Badge variant="secondary" className="gap-1">
-          <Loader2 className="h-3 w-3 animate-spin" />
-          测试中
-        </Badge>
-      )
-    }
-
-    if (!result) return null
-
-    if (result.network_ok) {
-      if (result.api_key_valid === true) {
-        return (
-          <Badge className="gap-1 bg-green-600 hover:bg-green-700">
-            <CheckCircle2 className="h-3 w-3" />
-            正常
-          </Badge>
-        )
-      } else if (result.api_key_valid === false) {
-        return (
-          <Badge variant="destructive" className="gap-1">
-            <AlertCircle className="h-3 w-3" />
-            Key无效
-          </Badge>
-        )
-      } else {
-        return (
-          <Badge className="gap-1 bg-blue-600 hover:bg-blue-700">
-            <CheckCircle2 className="h-3 w-3" />
-            可访问
-          </Badge>
-        )
-      }
-    } else {
-      return (
-        <Badge variant="destructive" className="gap-1">
-          <XCircle className="h-3 w-3" />
-          离线
-        </Badge>
-      )
-    }
+    return renderProviderTestStatus(result, isTesting)
   }
 
   return (
-    <div className="rounded-lg border bg-card p-4 space-y-3">
+    <div className="bg-card space-y-3 rounded-lg border p-4">
       <div className="flex items-start justify-between gap-2">
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <h3 className="font-semibold text-base truncate">{provider.name}</h3>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="truncate text-base font-semibold">{provider.name}</h3>
             {renderTestStatus()}
           </div>
-          <p className="text-xs text-muted-foreground mt-1 break-all">{provider.base_url}</p>
+          <p className="text-muted-foreground mt-1 text-xs break-all">{provider.base_url}</p>
         </div>
-        <div className="flex gap-1 flex-shrink-0">
+        <div className="flex flex-shrink-0 gap-1">
           <Button
             variant="outline"
             size="sm"
@@ -101,13 +59,17 @@ export function ProviderCard({
             variant="default"
             size="sm"
             onClick={() => onEdit(provider, actualIndex)}
+            title="编辑"
+            aria-label={`编辑厂商 ${provider.name}`}
           >
             <Pencil className="h-4 w-4" strokeWidth={2} fill="none" />
           </Button>
           <Button
             size="sm"
             onClick={() => onDelete(actualIndex)}
-            className="bg-red-600 hover:bg-red-700 text-white"
+            className="bg-red-600 text-white hover:bg-red-700"
+            title="删除"
+            aria-label={`删除厂商 ${provider.name}`}
           >
             <Trash2 className="h-4 w-4" strokeWidth={2} fill="none" />
           </Button>
@@ -119,16 +81,14 @@ export function ProviderCard({
           <p className="font-medium">{provider.client_type}</p>
         </div>
         <div>
-          <span className="text-muted-foreground text-xs">最大重试</span>
-          <p className="font-medium">{provider.max_retry}</p>
+          <span className="text-muted-foreground text-xs">重试</span>
+          <p className="font-medium">
+            {provider.max_retry} 次 / {provider.retry_interval} 秒
+          </p>
         </div>
         <div>
           <span className="text-muted-foreground text-xs">超时(秒)</span>
           <p className="font-medium">{provider.timeout}</p>
-        </div>
-        <div>
-          <span className="text-muted-foreground text-xs">重试间隔(秒)</span>
-          <p className="font-medium">{provider.retry_interval}</p>
         </div>
       </div>
     </div>

@@ -1,7 +1,6 @@
-"""reply 内置工具。"""
+﻿"""reply 内置工具。"""
 
 from typing import Any, Optional
-
 import traceback
 
 from src.chat.replyer.replyer_manager import replyer_manager
@@ -10,12 +9,17 @@ from src.common.data_models.reply_generation_data_models import ReplyGenerationR
 from src.common.logger import get_logger
 from src.config import config as config_module
 from src.core.tooling import ToolExecutionContext, ToolExecutionResult, ToolInvocation, ToolSpec
-from src.maisaka.message_adapter import build_visible_text_from_sequence
+from src.maisaka.context.message_adapter import build_visible_text_from_sequence
 from src.services import send_service
 
 from .context import BuiltinToolRuntimeContext
 
 logger = get_logger("maisaka_builtin_reply")
+_REPLY_TOOL_INTERNAL_ARGUMENTS = {"msg_id", "set_quote", "reference_info"}
+
+
+def _use_expression_intent() -> bool:
+    return config_module.global_config.expression.expression_selection_mode == "vector_intent"
 
 
 async def _run_expression_selector(tool_ctx: BuiltinToolRuntimeContext, system_prompt: str) -> str:
@@ -31,27 +35,64 @@ async def _run_expression_selector(tool_ctx: BuiltinToolRuntimeContext, system_p
 def get_tool_spec() -> ToolSpec:
     """获取 reply 工具声明。"""
 
+    properties: dict[str, Any] = {
+        "msg_id": {
+            "type": "string",
+            "description": "要回复的消息msg_id。",
+        },
+        "set_quote": {
+            "type": "boolean",
+            "description": "以引用回复的方式发送这条回复，不用每句都引用。",
+            "default": True,
+        },
+        "reply_guide": {
+            "type": "string",
+            "description": "回复需要注意的事项和回复指引",
+        },
+    }
+    if _use_expression_intent():
+        properties["expression_intent"] = {
+            "type": "object",
+            "description": (
+                "可选。给 replyer 表达方式选择使用的结构化意图，不是回复正文。"
+                "当这次回复需要特定语气、场景或话术时填写，避免表达选择只按关键词匹配。"
+            ),
+            "properties": {
+                "focus": {
+                    "type": "string",
+                    "description": "本次表达主要应该贴合的目标消息、片段或话题。",
+                },
+                "reply_act": {
+                    "type": "string",
+                    "description": "这次回复要完成的动作，例如澄清、安抚、调侃、追问、解释边界。",
+                },
+                "scene": {
+                    "type": "string",
+                    "description": "当前表达场景，例如技术排查、截图分享、撒娇玩笑、价格询问。",
+                },
+                "tone": {
+                    "type": "string",
+                    "description": "期望语气，例如轻松、可靠、吐槽、委婉、简短肯定。",
+                },
+                "prefer": {
+                    "type": "array",
+                    "description": "优先考虑的表达类型或话术倾向。",
+                    "items": {"type": "string"},
+                },
+                "avoid": {
+                    "type": "array",
+                    "description": "需要避免的表达类型、误判方向或不该注入的具体结论。",
+                    "items": {"type": "string"},
+                },
+            },
+        }
+
     return ToolSpec(
         name="reply",
         description="根据当前思考生成并发送一条可见回复。",
         parameters_schema={
             "type": "object",
-            "properties": {
-                "msg_id": {
-                    "type": "string",
-                    "description": "要回复的目标用户消息编号。",
-                },
-                "set_quote": {
-                    "type": "boolean",
-                    "description": "以引用回复的方式发送这条回复，不用每句都引用。",
-                    "default": True,
-                },
-                "reference_info": {
-                    "type": "string",
-                    "description": "有助于回复的信息，之前搜集得到的事实性信息，记忆等，使用平文本格式。",
-                    "default": True,
-                },
-            },
+            "properties": properties,
             "required": ["msg_id"],
         },
         provider_name="maisaka_builtin",
@@ -87,15 +128,6 @@ def _build_send_result(
     }
 
 
-def _get_selected_expression_habits(reply_result: ReplyGenerationResult) -> str:
-    """读取 replyer 本轮实际使用的表达方式说明。"""
-
-    extra = reply_result.metrics.extra
-    if not isinstance(extra, dict):
-        return ""
-    return str(extra.get("selected_expression_habits") or "").strip()
-
-
 async def handle_tool(
     tool_ctx: BuiltinToolRuntimeContext,
     invocation: ToolInvocation,
@@ -104,15 +136,16 @@ async def handle_tool(
     """执行 reply 内置工具。"""
 
     latest_thought = context.reasoning if context is not None else invocation.reasoning
-    reference_info = str(invocation.arguments.get("reference_info") or "").strip()
     target_message_id = str(invocation.arguments.get("msg_id") or "").strip()
     set_quote = bool(invocation.arguments.get("set_quote", True))
     reply_tool_args = {
         key: value
         for key, value in dict(invocation.arguments or {}).items()
-        if key not in {"msg_id", "set_quote", "reference_info"}
+        if key not in _REPLY_TOOL_INTERNAL_ARGUMENTS
     }
-    enable_reply_quote = bool(config_module.global_config.chat.enable_reply_quote)
+    if not _use_expression_intent():
+        reply_tool_args.pop("expression_intent", None)
+    enable_reply_quote = bool(config_module.global_config.chat.reply_style.enable_reply_quote)
     effective_set_quote = set_quote and enable_reply_quote
 
     if not target_message_id:
@@ -131,13 +164,11 @@ async def handle_tool(
     try:
         replyer = replyer_manager.get_replyer(
             chat_stream=tool_ctx.runtime.chat_stream,
-            request_type="maisaka_replyer",
+            request_type="maisaka.replyer",
             replyer_type="maisaka",
         )
     except Exception:
-        logger.exception(
-            f"{tool_ctx.runtime.log_prefix} 获取回复生成器时发生异常: 目标消息编号={target_message_id}"
-        )
+        logger.exception(f"{tool_ctx.runtime.log_prefix} 获取回复生成器时发生异常: 目标消息编号={target_message_id}")
         logger.info(traceback.format_exc())
         return tool_ctx.build_failure_result(
             invocation.tool_name,
@@ -152,11 +183,9 @@ async def handle_tool(
         )
 
     replyer_chat_history = list(tool_ctx.runtime._chat_history)
-
     try:
         success, reply_result = await replyer.generate_reply_with_context(
             reply_reason=latest_thought,
-            reference_info=reference_info,
             stream_id=tool_ctx.runtime.session_id,
             reply_message=target_message,
             chat_history=replyer_chat_history,
@@ -217,7 +246,7 @@ async def handle_tool(
                     stream_id=tool_ctx.runtime.session_id,
                     processed_plain_text=segment,
                     set_reply=segment_set_quote,
-                    reply_message=target_message if segment_set_quote else None,
+                    reply_message=target_message,
                     selected_expressions=reply_result.selected_expression_ids or None,
                     typing=index > 0,
                     sync_to_maisaka_history=True,
@@ -247,9 +276,7 @@ async def handle_tool(
                     )
                 )
     except Exception:
-        logger.exception(
-            f"{tool_ctx.runtime.log_prefix} 发送文字消息时发生异常，目标消息编号={target_message_id}"
-        )
+        logger.exception(f"{tool_ctx.runtime.log_prefix} 发送文字消息时发生异常，目标消息编号={target_message_id}")
         return tool_ctx.build_failure_result(
             invocation.tool_name,
             "发送可见回复时发生异常。",
@@ -276,10 +303,6 @@ async def handle_tool(
 
     if tool_ctx.runtime.chat_stream.platform == CLI_PLATFORM_NAME:
         tool_ctx.append_guided_reply_to_chat_history(combined_reply_text)
-    tool_ctx.append_replyer_expression_annotation(
-        selected_expression_ids=reply_result.selected_expression_ids,
-        expression_habits=_get_selected_expression_habits(reply_result),
-    )
     reply_metadata["sent_message_ids"] = sent_message_ids
     reply_metadata["send_results"] = send_results
     track_reply_effect = getattr(tool_ctx.runtime, "track_reply_effect", None)
@@ -291,7 +314,6 @@ async def handle_tool(
             reply_text=combined_reply_text,
             reply_segments=reply_segments,
             planner_reasoning=latest_thought,
-            reference_info=reference_info,
             tool_context={
                 "tool_name": invocation.tool_name,
                 "call_id": invocation.call_id,

@@ -11,9 +11,12 @@ interface UpdatesTabProps {
   maimaiVersion: MaimaiVersion | null
   pluginStats: Record<string, PluginStatsData>
   loadProgress: PluginLoadProgress | null
+  likingPluginIds: Set<string>
   onInstall: (plugin: PluginInfo) => void
+  onLike: (plugin: PluginInfo) => void
   onUpdate: (plugin: PluginInfo) => void
   onUninstall: (plugin: PluginInfo) => void
+  onDetail: (plugin: PluginInfo) => void
   checkPluginCompatibility: (plugin: PluginInfo) => boolean
   needsUpdate: (plugin: PluginInfo) => boolean
   getStatusBadge: (plugin: PluginInfo) => React.JSX.Element | null
@@ -29,9 +32,12 @@ export function UpdatesTab({
   maimaiVersion,
   pluginStats,
   loadProgress,
+  likingPluginIds,
   onInstall,
+  onLike,
   onUpdate,
   onUninstall,
+  onDetail,
   checkPluginCompatibility,
   needsUpdate,
   getStatusBadge,
@@ -76,9 +82,12 @@ export function UpdatesTab({
           maimaiVersion={maimaiVersion}
           pluginStats={pluginStats}
           loadProgress={loadProgress}
+          likingPluginIds={likingPluginIds}
           onInstall={onInstall}
+          onLike={onLike}
           onUpdate={onUpdate}
           onUninstall={onUninstall}
+          onDetail={onDetail}
           checkPluginCompatibility={checkPluginCompatibility}
           needsUpdate={needsUpdate}
           getStatusBadge={getStatusBadge}

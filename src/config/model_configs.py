@@ -2,6 +2,7 @@ from enum import Enum
 from typing import Any
 
 from src.common.i18n import t
+
 from .config_base import ConfigBase, Field
 
 
@@ -406,7 +407,7 @@ class TaskConfig(ConfigBase):
             "advanced": True,
         },
     )
-    """慢请求阈值（秒），超过此值会输出警告日志"""
+    """超时警告时间（秒），超过此时间会输出警告日志"""
 
     selection_strategy: str = Field(
         default="balance",
@@ -431,19 +432,6 @@ class TaskConfig(ConfigBase):
     """任务硬超时（秒），到点未返回则取消请求并尝试切换下一个模型；防止上游代理静默排队导致主循环饥饿"""
 
 
-def _default_timing_gate_task_config() -> TaskConfig:
-    """创建 Timing Gate 任务默认配置。"""
-
-    return TaskConfig(
-        model_list=[],
-        max_tokens=4096,
-        temperature=0.3,
-        slow_threshold=12.0,
-        selection_strategy="random",
-        hard_timeout=120.0,
-    )
-
-
 class ModelTaskConfig(ConfigBase):
     """模型配置类"""
 
@@ -454,7 +442,7 @@ class ModelTaskConfig(ConfigBase):
             "x-icon": "message-square",
         },
     )
-    """回复模型配置"""
+    """回复模型，影响麦麦的回复表现"""
 
     planner: TaskConfig = Field(
         default_factory=TaskConfig,
@@ -463,17 +451,7 @@ class ModelTaskConfig(ConfigBase):
             "x-icon": "map",
         },
     )
-    """规划模型配置"""
-
-    timing_gate: TaskConfig = Field(
-        default_factory=_default_timing_gate_task_config,
-        json_schema_extra={
-            "x-widget": "custom",
-            "x-icon": "timer",
-            "advanced": True,
-        },
-    )
-    """Timing Gate 节奏控制模型配置；留空时自动继用 planner 模型"""
+    """规划模型，决定麦麦的行动，需要有一定Agent能力的模型"""
 
     memory: TaskConfig = Field(
         default_factory=TaskConfig,
@@ -483,7 +461,7 @@ class ModelTaskConfig(ConfigBase):
             "advanced": True,
         },
     )
-    """记忆模型配置，用于长期记忆总结、抽取、写回等高质量记忆任务；留空时由调用方按需回退"""
+    """记忆模型配置，用于长期记忆总结、抽取、写回等高记忆任务；留空时由调用方按需回退"""
 
     mid_memory: TaskConfig = Field(
         default_factory=TaskConfig,
@@ -493,7 +471,7 @@ class ModelTaskConfig(ConfigBase):
             "advanced": True,
         },
     )
-    """中期聊天摘要模型配置；留空时自动继用 planner 模型"""
+    """聊天回想模型配置；留空时自动继用 planner 模型"""
 
     utils: TaskConfig = Field(
         default_factory=TaskConfig,
@@ -502,7 +480,7 @@ class ModelTaskConfig(ConfigBase):
             "x-icon": "wrench",
         },
     )
-    """组件使用的模型, 例如表情包模块, 取名模块, 关系模块, 麦麦的情绪变化等，是麦麦必须的模型"""
+    """执行文本概括，整理等小任务，是麦麦必须的模型。可以选择速度快的小尺寸模型"""
 
     learner: TaskConfig = Field(
         default_factory=TaskConfig,
@@ -512,7 +490,17 @@ class ModelTaskConfig(ConfigBase):
             "advanced": True,
         },
     )
-    """学习模型配置，用于表达方式学习和黑话学习；留空时自动继用 utils 模型"""
+    """学习模型配置，用于表达方式学习和黑话学习；留空时用 utils 模型"""
+
+    expression_use: TaskConfig = Field(
+        default_factory=TaskConfig,
+        json_schema_extra={
+            "x-widget": "custom",
+            "x-icon": "message-circle-more",
+            "advanced": True,
+        },
+    )
+    """表达方式使用模型配置；留空时用 utils 模型"""
 
     emoji: TaskConfig = Field(
         default_factory=TaskConfig,
@@ -531,7 +519,7 @@ class ModelTaskConfig(ConfigBase):
             "x-icon": "image",
         },
     )
-    """视觉模型配置"""
+    """视觉模型，需要能够识图的模型"""
 
     voice: TaskConfig = Field(
         default_factory=TaskConfig,
@@ -541,7 +529,7 @@ class ModelTaskConfig(ConfigBase):
             "advanced": True,
         },
     )
-    """语音识别模型配置"""
+    """语音识别模型"""
 
     embedding: TaskConfig = Field(
         default_factory=TaskConfig,
@@ -550,4 +538,4 @@ class ModelTaskConfig(ConfigBase):
             "x-icon": "database",
         },
     )
-    """嵌入模型配置"""
+    """嵌入模型，需要文本嵌入类型的模型，不可使用LLM"""

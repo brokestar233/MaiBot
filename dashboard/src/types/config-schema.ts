@@ -20,8 +20,10 @@ export type XWidgetType =
   | 'select'
   | 'slider'
   | 'switch'
+  | 'tags'
   | 'talk-time'
   | 'textarea'
+  | 'comma-list'
 
 export type LocalizedText = string | Record<string, string>
 export type DescriptionDisplayMode = 'inline' | 'icon' | 'label-hover'
@@ -45,8 +47,12 @@ export interface FieldSchema {
   'x-layout'?: 'inline-right'
   'x-input-width'?: string
   'x-description-display'?: DescriptionDisplayMode
+  'x-collapsed-by-default'?: boolean
+  'x-option-labels'?: Record<string, string>
   'x-option-descriptions'?: Record<string, string>
+  'x-placeholder'?: string
   'x-row'?: string
+  'x-display-as-section'?: boolean
   'x-textarea-min-height'?: number
   'x-textarea-rows'?: number
   advanced?: boolean
@@ -60,7 +66,11 @@ export interface ConfigSchema {
   nested?: Record<string, ConfigSchema>
   uiParent?: string
   uiLabel?: string
-  uiIcon?: string
+  uiAdvanced?: boolean
+  uiOrder?: number
+  uiUseSubTabs?: boolean
+  uiSubLabel?: string
+  uiRootSubLabel?: string
 }
 
 export interface ConfigSchemaResponse {
